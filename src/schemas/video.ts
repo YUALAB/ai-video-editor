@@ -2,11 +2,12 @@ import { z } from 'zod'
 
 export const VideoFormatSchema = z.enum(['tiktok', 'youtube', 'square', 'landscape'])
 
+// Server-side schema (no File type)
 export const VideoEditRequestSchema = z.object({
   prompt: z.string().min(1, 'プロンプトを入力してください'),
   format: VideoFormatSchema.default('tiktok'),
-  videoFile: z.instanceof(File).optional(),
   videoUrl: z.string().url().optional(),
+  hasVideo: z.boolean().optional(),
 })
 
 export const VideoEditResponseSchema = z.object({

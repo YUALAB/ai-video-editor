@@ -5,28 +5,29 @@ export async function POST(request: NextRequest) {
   try {
     const formData = await request.formData()
 
-    const prompt = formData.get('prompt') as string
-    const format = formData.get('format') as string
-    const video = formData.get('video') as File | null
+    const prompt = formData.get('prompt')
+    const format = formData.get('format')
+    const video = formData.get('video')
 
     // Validate input
     const validationResult = VideoEditRequestSchema.safeParse({
-      prompt,
-      format,
-      videoFile: video,
+      prompt: typeof prompt === 'string' ? prompt : '',
+      format: typeof format === 'string' ? format : 'tiktok',
+      hasVideo: video !== null,
     })
 
     if (!validationResult.success) {
       return NextResponse.json(
-        { error: 'Invalid request', details: validationResult.error.errors },
+        { error: 'Invalid request', details: validationResult.error.issues },
         { status: 400 }
       )
     }
 
-    // TODO: Send to Railway backend for processing
-    // For now, return a mock response
+    // Generate job ID
     const jobId = crypto.randomUUID()
 
+    // TODO: Upload video to storage and send to Railway backend
+    // For now, return a mock response
     return NextResponse.json({
       id: jobId,
       status: 'pending',
