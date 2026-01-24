@@ -15,14 +15,19 @@ interface JobStatus {
   error?: string
 }
 
+const MAX_FILE_SIZE_MB = 500
+const MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024
+
 export function VideoEditor() {
   const [prompt, setPrompt] = useState('')
   const [format, setFormat] = useState<VideoFormat>('tiktok')
   const [file, setFile] = useState<File | null>(null)
+  const [fileError, setFileError] = useState<string | null>(null)
   const [isProcessing, setIsProcessing] = useState(false)
   const [jobId, setJobId] = useState<string | null>(null)
   const [jobStatus, setJobStatus] = useState<JobStatus | null>(null)
   const [dragActive, setDragActive] = useState(false)
+  const [backendError, setBackendError] = useState<string | null>(null)
 
   const formats: { value: VideoFormat; label: string; aspect: string }[] = [
     { value: 'tiktok', label: 'TikTok', aspect: '9:16' },
@@ -66,30 +71,51 @@ export function VideoEditor() {
     }
   }, [])
 
+  const validateAndSetFile = useCallback((selectedFile: File) => {
+    setFileError(null)
+
+    if (!selectedFile.type.startsWith('video/')) {
+      setFileError('動画ファイルのみアップロードできます')
+      return
+    }
+
+    if (selectedFile.size > MAX_FILE_SIZE) {
+      setFileError(`ファイルサイズは${MAX_FILE_SIZE_MB}MB以下にしてください`)
+      return
+    }
+
+    setFile(selectedFile)
+  }, [])
+
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault()
     e.stopPropagation()
     setDragActive(false)
     if (e.dataTransfer.files?.[0]) {
-      const droppedFile = e.dataTransfer.files[0]
-      if (droppedFile.type.startsWith('video/')) {
-        setFile(droppedFile)
-      }
+      validateAndSetFile(e.dataTransfer.files[0])
     }
-  }, [])
+  }, [validateAndSetFile])
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFile = e.target.files?.[0]
     if (selectedFile) {
-      setFile(selectedFile)
+      validateAndSetFile(selectedFile)
     }
   }
 
   const handleSubmit = async () => {
     if (!prompt || !file) return
 
+    const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL
+
+    if (!backendUrl) {
+      setBackendError('バックエンドサーバーが設定されていません。管理者にお問い合わせください。')
+      return
+    }
+
     setIsProcessing(true)
     setJobStatus(null)
+    setBackendError(null)
 
     try {
       const formData = new FormData()
@@ -97,11 +123,29 @@ export function VideoEditor() {
       formData.append('format', format)
       formData.append('video', file)
 
-      const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || ''
       const response = await fetch(`${backendUrl}/api/edit`, {
         method: 'POST',
         body: formData,
       })
+
+      if (!response.ok) {
+        let errorMessage = 'サーバーエラーが発生しました'
+
+        if (response.status === 413) {
+          errorMessage = 'ファイルサイズが大きすぎます'
+        } else if (response.status === 429) {
+          errorMessage = 'リクエストが多すぎます。しばらく待ってから再試行してください'
+        } else {
+          try {
+            const errorData = await response.json()
+            errorMessage = errorData.error || errorData.detail || errorMessage
+          } catch {
+            // Response is not JSON, use default message
+          }
+        }
+
+        throw new Error(errorMessage)
+      }
 
       const data = await response.json() as { id: string }
       setJobId(data.id)
@@ -113,17 +157,19 @@ export function VideoEditor() {
         id: '',
         status: 'failed',
         progress: 0,
-        error: '処理を開始できませんでした'
+        error: error instanceof Error ? error.message : '処理を開始できませんでした'
       })
     }
   }
 
   const handleReset = () => {
     setFile(null)
+    setFileError(null)
     setPrompt('')
     setJobId(null)
     setJobStatus(null)
     setIsProcessing(false)
+    setBackendError(null)
   }
 
   return (
@@ -143,7 +189,8 @@ export function VideoEditor() {
           <div
             className={`border-2 border-dashed rounded-lg p-8 text-center transition-colors
               ${dragActive ? 'border-purple-500 bg-purple-50' : 'border-gray-300 hover:border-gray-400'}
-              ${file ? 'bg-green-50 border-green-300' : ''}`}
+              ${file ? 'bg-green-50 border-green-300' : ''}
+              ${fileError ? 'bg-red-50 border-red-300' : ''}`}
             onDragEnter={handleDrag}
             onDragLeave={handleDrag}
             onDragOver={handleDrag}
@@ -171,8 +218,24 @@ export function VideoEditor() {
                   ? `${(file.size / 1024 / 1024).toFixed(2)} MB`
                   : 'クリックまたはドラッグ＆ドロップ'}
               </p>
+              {fileError && (
+                <p className="text-sm text-red-600 mt-2 flex items-center justify-center gap-1">
+                  <XCircle className="h-4 w-4" />
+                  {fileError}
+                </p>
+              )}
             </label>
           </div>
+
+          {/* Backend Error */}
+          {backendError && (
+            <div className="p-4 bg-red-50 border border-red-200 rounded-lg">
+              <p className="text-red-700 flex items-center gap-2">
+                <XCircle className="h-5 w-5" />
+                {backendError}
+              </p>
+            </div>
+          )}
 
           {/* Format Selection */}
           <div>
