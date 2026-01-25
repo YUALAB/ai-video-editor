@@ -41,6 +41,9 @@ const nextConfig: NextConfig = {
     ];
   },
 
+  // Exclude @ffmpeg packages from server-side bundling
+  serverExternalPackages: ["@ffmpeg/ffmpeg", "@ffmpeg/util"],
+
   poweredByHeader: false,
 };
 

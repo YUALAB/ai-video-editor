@@ -1,5 +1,7 @@
 'use client'
 
+import { FFmpeg } from '@ffmpeg/ffmpeg'
+
 export interface ProcessingProgress {
   progress: number
   message: string
@@ -18,19 +20,16 @@ export const VIDEO_FORMATS: Record<string, VideoFormat> = {
   landscape: { width: 1920, height: 1080, name: 'Landscape' },
 }
 
-// FFmpeg instance - loaded dynamically
-let ffmpegInstance: any = null
+// FFmpeg instance
+let ffmpegInstance: FFmpeg | null = null
 let ffmpegLoaded = false
-let FFmpegClass: any = null
 
-// CDN URLs
-const FFMPEG_VERSION = '0.12.10'
+// CDN URL for core files
 const CORE_VERSION = '0.12.6'
-const FFMPEG_BASE = `https://unpkg.com/@ffmpeg/ffmpeg@${FFMPEG_VERSION}/dist/esm`
 const CORE_BASE = `https://unpkg.com/@ffmpeg/core@${CORE_VERSION}/dist/esm`
 
 /**
- * Fetch a script and convert to blob URL
+ * Fetch a file and convert to blob URL
  */
 async function fetchAsBlob(url: string, type: string): Promise<string> {
   const response = await fetch(url)
@@ -41,33 +40,9 @@ async function fetchAsBlob(url: string, type: string): Promise<string> {
   return URL.createObjectURL(new Blob([blob], { type }))
 }
 
-/**
- * Dynamic import that bypasses webpack/turbopack bundling
- */
-async function dynamicImportFromURL(url: string): Promise<any> {
-  const importFn = new Function('url', 'return import(url)')
-  return importFn(url)
-}
-
-/**
- * Load FFmpeg class from CDN
- */
-async function getFFmpegClass(): Promise<any> {
-  if (FFmpegClass) {
-    return FFmpegClass
-  }
-
-  // Fetch FFmpeg main module and create blob URL
-  const ffmpegBlobURL = await fetchAsBlob(`${FFMPEG_BASE}/index.js`, 'text/javascript')
-  const module = await dynamicImportFromURL(ffmpegBlobURL)
-
-  FFmpegClass = module.FFmpeg
-  return FFmpegClass
-}
-
 export async function loadFFmpeg(
   onProgress?: (progress: ProcessingProgress) => void
-): Promise<any> {
+): Promise<FFmpeg> {
   if (ffmpegInstance && ffmpegLoaded) {
     return ffmpegInstance
   }
@@ -75,16 +50,13 @@ export async function loadFFmpeg(
   onProgress?.({ progress: 0, message: 'FFmpegを読み込み中...' })
 
   try {
-    // Load FFmpeg class from CDN
-    const FFmpeg = await getFFmpegClass()
-
     ffmpegInstance = new FFmpeg()
 
-    ffmpegInstance.on('log', ({ message }: { message: string }) => {
+    ffmpegInstance.on('log', ({ message }) => {
       console.log('[FFmpeg]', message)
     })
 
-    ffmpegInstance.on('progress', ({ progress }: { progress: number }) => {
+    ffmpegInstance.on('progress', ({ progress }) => {
       const percent = Math.round(progress * 100)
       onProgress?.({
         progress: Math.min(Math.max(percent, 0), 99),
@@ -94,11 +66,10 @@ export async function loadFFmpeg(
 
     onProgress?.({ progress: 5, message: 'FFmpegコアを読み込み中...' })
 
-    // Fetch all required files and create blob URLs
-    const [coreURL, wasmURL, workerURL] = await Promise.all([
+    // Fetch core files and create blob URLs
+    const [coreURL, wasmURL] = await Promise.all([
       fetchAsBlob(`${CORE_BASE}/ffmpeg-core.js`, 'text/javascript'),
       fetchAsBlob(`${CORE_BASE}/ffmpeg-core.wasm`, 'application/wasm'),
-      fetchAsBlob(`${FFMPEG_BASE}/worker.js`, 'text/javascript'),
     ])
 
     onProgress?.({ progress: 8, message: 'FFmpegを初期化中...' })
@@ -106,7 +77,6 @@ export async function loadFFmpeg(
     await ffmpegInstance.load({
       coreURL,
       wasmURL,
-      workerURL,
     })
 
     ffmpegLoaded = true
@@ -178,7 +148,7 @@ export async function processVideo(
   onProgress?.({ progress: 100, message: '完了!' })
 
   // Convert to Blob
-  return new Blob([outputData], { type: 'video/mp4' })
+  return new Blob([new Uint8Array(outputData as Uint8Array)], { type: 'video/mp4' })
 }
 
 export function isFFmpegSupported(): boolean {
