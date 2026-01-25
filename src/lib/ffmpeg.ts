@@ -986,3 +986,50 @@ export async function processProject(
 
   return new Blob([new Uint8Array(outputData as Uint8Array)], { type: 'video/mp4' })
 }
+
+// Convert WebM to MP4 using FFmpeg (for canvas capture output)
+export async function convertWebMToMP4(
+  webmBlob: Blob,
+  onProgress?: (progress: ProcessingProgress) => void
+): Promise<Blob> {
+  const ff = await loadFFmpeg(onProgress)
+
+  onProgress?.({ progress: 10, message: 'WebMを読み込み中...' })
+
+  const arrayBuffer = await webmBlob.arrayBuffer()
+  await ff.writeFile('input.webm', new Uint8Array(arrayBuffer))
+
+  onProgress?.({ progress: 30, message: 'MP4に変換中...' })
+
+  const args = [
+    '-i', 'input.webm',
+    '-c:v', 'libx264',
+    '-preset', 'slow',
+    '-crf', '17',
+    '-c:a', 'aac',
+    '-b:a', '256k',
+    '-movflags', '+faststart',
+    '-y',
+    'output.mp4'
+  ]
+
+  try {
+    await ff.exec(args)
+  } catch (error) {
+    console.error('WebM to MP4 conversion error:', error)
+    throw new Error('MP4への変換に失敗しました')
+  }
+
+  onProgress?.({ progress: 90, message: '出力ファイルを準備中...' })
+
+  const outputData = await ff.readFile('output.mp4')
+
+  try {
+    await ff.deleteFile('input.webm')
+    await ff.deleteFile('output.mp4')
+  } catch { /* ignore */ }
+
+  onProgress?.({ progress: 100, message: '完了!' })
+
+  return new Blob([new Uint8Array(outputData as Uint8Array)], { type: 'video/mp4' })
+}

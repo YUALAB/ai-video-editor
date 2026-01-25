@@ -134,6 +134,9 @@ export function VideoEditor() {
   const inputRef = useRef<HTMLInputElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const previewVideoRef = useRef<HTMLVideoElement>(null)
+  const canvasRef = useRef<HTMLCanvasElement>(null)
+  const [isExporting, setIsExporting] = useState(false)
+  const [exportProgress, setExportProgress] = useState(0)
 
   useEffect(() => {
     setIsSupported(isFFmpegSupported())
@@ -711,6 +714,7 @@ export function VideoEditor() {
     }
   }
 
+  // Canvas-based WYSIWYG export - captures exactly what's shown in preview
   const handleExport = async () => {
     if (project.timeline.length === 0) {
       setAiMessages(prev => [...prev, {
@@ -720,45 +724,376 @@ export function VideoEditor() {
       return
     }
 
+    setIsExporting(true)
     setIsProcessing(true)
     setError(null)
-    setProgress({ progress: 0, message: '準備中...' })
-
-    setAiMessages(prev => [...prev, { role: 'ai', text: '動画を処理しています...' }])
+    setExportProgress(0)
+    setProgress({ progress: 0, message: 'エクスポート準備中...' })
 
     try {
-      // Include subtitles in the project for export
-      const projectWithSubtitles = {
-        ...project,
-        subtitles: subtitles.length > 0 ? {
-          segments: subtitles.map(s => ({
-            startTime: s.startTime,
-            endTime: s.endTime,
-            text: s.text
-          })),
-          style: subtitleStyle
-        } : undefined
-      }
-      const outputBlob = await processProject(projectWithSubtitles, format, (p) => setProgress(p))
-      const url = URL.createObjectURL(outputBlob)
-      setProgress(null)
+      setAiMessages(prev => [...prev, { role: 'ai', text: 'プレビューを録画中...' }])
+      // Create offscreen canvas for recording
+      const canvas = document.createElement('canvas')
+      const ctx = canvas.getContext('2d')!
 
-      setAiMessages(prev => [...prev, {
-        role: 'ai',
-        text: '完成しました！',
-        video: { url, name: 'output.mp4', isOutput: true }
-      }])
+      // Set canvas size based on format
+      const formatSizes: Record<string, { width: number; height: number }> = {
+        tiktok: { width: 1080, height: 1920 },
+        youtube: { width: 1920, height: 1080 },
+        square: { width: 1080, height: 1080 }
+      }
+      const size = formatSizes[format] || formatSizes.youtube
+      canvas.width = size.width
+      canvas.height = size.height
+
+      // Create audio context for mixing audio from clips
+      const audioContext = new AudioContext()
+      const audioDestination = audioContext.createMediaStreamDestination()
+
+      // Setup MediaRecorder - detect best supported mime type
+      const canvasStream = canvas.captureStream(30)
+      const combinedStream = new MediaStream([
+        ...canvasStream.getVideoTracks(),
+        ...audioDestination.stream.getAudioTracks()
+      ])
+
+      // Prefer MP4 (Safari/iOS), fallback to WebM
+      let mimeType = 'video/webm;codecs=vp9,opus'
+      let isNativeMP4 = false
+      if (typeof MediaRecorder !== 'undefined') {
+        if (MediaRecorder.isTypeSupported('video/mp4;codecs=avc1.42E01E,mp4a.40.2')) {
+          mimeType = 'video/mp4;codecs=avc1.42E01E,mp4a.40.2'
+          isNativeMP4 = true
+        } else if (MediaRecorder.isTypeSupported('video/mp4')) {
+          mimeType = 'video/mp4'
+          isNativeMP4 = true
+        } else if (!MediaRecorder.isTypeSupported(mimeType)) {
+          if (MediaRecorder.isTypeSupported('video/webm;codecs=vp8,opus')) {
+            mimeType = 'video/webm;codecs=vp8,opus'
+          } else if (MediaRecorder.isTypeSupported('video/webm')) {
+            mimeType = 'video/webm'
+          }
+        }
+      }
+      console.log('Using MediaRecorder mimeType:', mimeType)
+
+      const mediaRecorder = new MediaRecorder(combinedStream, {
+        mimeType,
+        videoBitsPerSecond: 20000000,
+        audioBitsPerSecond: 256000
+      })
+
+      const recordedChunks: Blob[] = []
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data.size > 0) recordedChunks.push(e.data)
+      }
+
+      // Start recording
+      mediaRecorder.start(100)
+
+      // Calculate total duration for progress tracking
+      let totalRecordDuration = 0
+      for (const item of project.timeline) {
+        const clip = project.clips.find(c => c.id === item.clipId)
+        if (clip) totalRecordDuration += (clip.endTime - clip.startTime) / (project.globalEffects.speed || 1)
+      }
+
+      let elapsedRecordTime = 0
+
+      // Process all clips sequentially
+      for (let i = 0; i < project.timeline.length; i++) {
+        const timelineItem = project.timeline[i]
+        const clip = project.clips.find(c => c.id === timelineItem.clipId)
+        if (!clip) continue
+
+        const video = project.videos.find(v => v.id === clip.sourceId)
+        if (!video) continue
+
+        const clipDuration = (clip.endTime - clip.startTime) / (project.globalEffects.speed || 1)
+
+        // Record this clip with progress callback
+        await recordClipToCanvas(
+          video.url,
+          clip.startTime,
+          clip.endTime,
+          canvas,
+          ctx,
+          project.globalEffects,
+          subtitles,
+          subtitleStyle,
+          audioContext,
+          audioDestination,
+          project.globalEffects.mute || false,
+          (clipProgress) => {
+            const overallProgress = ((elapsedRecordTime + clipDuration * clipProgress) / totalRecordDuration) * 80
+            setProgress({ progress: Math.round(overallProgress), message: `クリップ${i + 1}を録画中...` })
+          }
+        )
+
+        elapsedRecordTime += clipDuration
+      }
+
+      // Stop recording
+      setProgress({ progress: 82, message: '録画完了' })
+
+      await new Promise<void>((resolve) => {
+        mediaRecorder.onstop = () => resolve()
+        mediaRecorder.stop()
+      })
+
+      audioContext.close()
+
+      // Create blob
+      const recordedBlob = new Blob(recordedChunks, { type: isNativeMP4 ? 'video/mp4' : 'video/webm' })
+
+      // Convert to MP4 if needed (not needed if already MP4)
+      let outputBlob: Blob
+      let extension: string
+
+      if (isNativeMP4) {
+        // Already MP4, no conversion needed
+        outputBlob = recordedBlob
+        extension = 'mp4'
+        setProgress({ progress: 100, message: '完了!' })
+      } else if (isFFmpegSupported()) {
+        try {
+          setProgress({ progress: 85, message: 'MP4に変換中...' })
+          outputBlob = await convertWebMToMP4(recordedBlob, (p) => {
+            setProgress({ progress: 85 + Math.round(p.progress * 0.15), message: p.message })
+          })
+          extension = 'mp4'
+        } catch (e) {
+          console.warn('MP4 conversion failed, using WebM:', e)
+          outputBlob = recordedBlob
+          extension = 'webm'
+        }
+      } else {
+        // Fallback: download as WebM
+        outputBlob = recordedBlob
+        extension = 'webm'
+        setProgress({ progress: 100, message: '完了!' })
+      }
+
+      // Download - use share API on mobile, fallback to link
+      const fileName = `edited_${format}_${Date.now()}.${extension}`
+      const url = URL.createObjectURL(outputBlob)
+
+      const isMobileDevice = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent)
+
+      if (isMobileDevice && navigator.share) {
+        try {
+          const file = new File([outputBlob], fileName, { type: outputBlob.type })
+          await navigator.share({ files: [file] })
+          setAiMessages(prev => [...prev, {
+            role: 'ai',
+            text: 'エクスポート完了！'
+          }])
+        } catch (e) {
+          // User cancelled share or not supported, fallback to open
+          window.open(url, '_blank')
+          setAiMessages(prev => [...prev, {
+            role: 'ai',
+            text: 'エクスポート完了！新しいタブで開きました。長押しで保存してください。'
+          }])
+        }
+      } else {
+        const a = document.createElement('a')
+        a.href = url
+        a.download = fileName
+        document.body.appendChild(a)
+        a.click()
+        document.body.removeChild(a)
+        setAiMessages(prev => [...prev, {
+          role: 'ai',
+          text: 'エクスポート完了！ダウンロードが開始されました。'
+        }])
+      }
+
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+
     } catch (err) {
-      console.error('Processing error:', err)
-      setError(err instanceof Error ? err.message : '処理中にエラーが発生しました')
+      console.error('Export error:', err)
+      setError(err instanceof Error ? err.message : 'エクスポート中にエラーが発生しました')
       setAiMessages(prev => [...prev, {
         role: 'ai',
         text: 'エラーが発生しました: ' + (err instanceof Error ? err.message : '不明なエラー')
       }])
-      setProgress(null)
     } finally {
+      setIsExporting(false)
       setIsProcessing(false)
+      setProgress(null)
+      setExportProgress(0)
     }
+  }
+
+  // Record a single clip to canvas with audio
+  async function recordClipToCanvas(
+    videoUrl: string,
+    startTime: number,
+    endTime: number,
+    canvas: HTMLCanvasElement,
+    ctx: CanvasRenderingContext2D,
+    effects: VideoEffects,
+    subtitleSegments: SubtitleSegment[],
+    subStyle: SubtitleStyle,
+    audioContext: AudioContext,
+    audioDestination: MediaStreamAudioDestinationNode,
+    muted: boolean,
+    onClipProgress?: (progress: number) => void
+  ): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const renderVideo = document.createElement('video')
+      renderVideo.crossOrigin = 'anonymous'
+      renderVideo.src = videoUrl
+      renderVideo.playsInline = true
+
+      renderVideo.onloadedmetadata = async () => {
+        renderVideo.currentTime = startTime
+
+        await new Promise<void>(r => {
+          renderVideo.onseeked = () => r()
+        })
+
+        // Connect audio
+        let audioSource: MediaElementAudioSourceNode | null = null
+        if (!muted) {
+          try {
+            audioSource = audioContext.createMediaElementSource(renderVideo)
+            // Apply speed effect to audio if needed
+            if (effects.speed && effects.speed !== 1) {
+              // Note: Web Audio API doesn't directly support playback rate changes
+              // The video.playbackRate will handle this, but audio pitch will change
+            }
+            audioSource.connect(audioDestination)
+          } catch (e) {
+            console.warn('Could not connect audio source:', e)
+          }
+        }
+
+        renderVideo.muted = muted
+        renderVideo.playbackRate = effects.speed || 1
+
+        const cssFilter = effectsToCssFilter(effects)
+        const duration = endTime - startTime
+        const actualDuration = duration / (effects.speed || 1)
+        const startRenderTime = performance.now()
+
+        await renderVideo.play()
+
+        const render = () => {
+          const elapsed = (performance.now() - startRenderTime) / 1000
+          const currentVideoTime = startTime + (elapsed * (effects.speed || 1))
+
+          if (currentVideoTime >= endTime || elapsed >= actualDuration) {
+            renderVideo.pause()
+            if (audioSource) {
+              try { audioSource.disconnect() } catch { /* ignore */ }
+            }
+            onClipProgress?.(1)
+            resolve()
+            return
+          }
+
+          // Report progress
+          onClipProgress?.(elapsed / actualDuration)
+
+          // Clear canvas
+          ctx.fillStyle = 'black'
+          ctx.fillRect(0, 0, canvas.width, canvas.height)
+
+          // Apply CSS filter
+          ctx.filter = cssFilter
+
+          // Calculate video positioning
+          const videoAspect = renderVideo.videoWidth / renderVideo.videoHeight
+          const canvasAspect = canvas.width / canvas.height
+
+          let drawWidth, drawHeight, drawX, drawY
+          if (videoAspect > canvasAspect) {
+            drawWidth = canvas.width
+            drawHeight = canvas.width / videoAspect
+            drawX = 0
+            drawY = (canvas.height - drawHeight) / 2
+          } else {
+            drawHeight = canvas.height
+            drawWidth = canvas.height * videoAspect
+            drawX = (canvas.width - drawWidth) / 2
+            drawY = 0
+          }
+
+          // Apply transforms
+          ctx.save()
+          if (effects.flip) {
+            ctx.translate(canvas.width, 0)
+            ctx.scale(-1, 1)
+          }
+          if (effects.rotate) {
+            ctx.translate(canvas.width / 2, canvas.height / 2)
+            ctx.rotate((effects.rotate * Math.PI) / 180)
+            ctx.translate(-canvas.width / 2, -canvas.height / 2)
+          }
+
+          ctx.drawImage(renderVideo, drawX, drawY, drawWidth, drawHeight)
+          ctx.restore()
+
+          // Reset filter for subtitles
+          ctx.filter = 'none'
+
+          // Draw subtitles - position relative to video area, not full canvas
+          const currentSub = subtitleSegments.find(s =>
+            currentVideoTime >= s.startTime && currentVideoTime <= s.endTime
+          )
+
+          if (currentSub) {
+            // Font size relative to video height (not canvas height)
+            const fontSizes: Record<string, number> = {
+              small: Math.round(drawHeight * 0.04),
+              medium: Math.round(drawHeight * 0.05),
+              large: Math.round(drawHeight * 0.065)
+            }
+            const fontSize = fontSizes[subStyle.fontSize] || fontSizes.medium
+
+            ctx.font = `bold ${fontSize}px "Noto Sans JP", "Hiragino Sans", sans-serif`
+            ctx.textAlign = 'center'
+            ctx.textBaseline = 'middle'
+
+            // Position relative to video area (drawY is top of video, drawHeight is video height)
+            let textY: number
+            switch (subStyle.position) {
+              case 'top': textY = drawY + drawHeight * 0.08; break
+              case 'center': textY = drawY + drawHeight * 0.5; break
+              default: textY = drawY + drawHeight * 0.90 // bottom, match preview visually
+            }
+
+            const metrics = ctx.measureText(currentSub.text)
+            const textWidth = metrics.width
+            const textHeight = fontSize * 1.4
+            const padding = fontSize * 0.3
+
+            if (subStyle.backgroundColor && subStyle.backgroundColor !== 'transparent') {
+              ctx.fillStyle = subStyle.backgroundColor
+              ctx.fillRect(
+                (canvas.width - textWidth) / 2 - padding,
+                textY - textHeight / 2,
+                textWidth + padding * 2,
+                textHeight
+              )
+            }
+
+            ctx.fillStyle = subStyle.color || '#ffffff'
+            ctx.fillText(currentSub.text, canvas.width / 2, textY)
+          }
+
+          requestAnimationFrame(render)
+        }
+
+        render()
+      }
+
+      renderVideo.onerror = () => {
+        reject(new Error('Failed to load video'))
+      }
+    })
   }
 
   // Generate subtitles using Whisper
@@ -923,9 +1258,9 @@ export function VideoEditor() {
                 {currentSubtitle && (
                   <div
                     className={`absolute left-0 right-0 flex justify-center pointer-events-none px-4 ${
-                      subtitleStyle.position === 'top' ? 'top-4' :
+                      subtitleStyle.position === 'top' ? 'top-[8%]' :
                       subtitleStyle.position === 'center' ? 'top-1/2 -translate-y-1/2' :
-                      'bottom-8'
+                      'top-[78%] -translate-y-1/2'
                     }`}
                   >
                     <span
@@ -957,18 +1292,10 @@ export function VideoEditor() {
           {project.timeline.length > 0 && (
             <div className="space-y-2">
               {/* Timeline Bar */}
-              <div className="relative">
-                <input
-                  type="range"
-                  min="0"
-                  max={totalDuration || 1}
-                  step="0.1"
-                  value={currentTime}
-                  onChange={handleSeek}
-                  className="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-blue-500"
-                />
-                {/* Clip markers on timeline */}
-                <div className="absolute top-0 left-0 right-0 h-2 pointer-events-none flex">
+              <div className="relative h-3">
+                {/* Bar background */}
+                <div className="absolute top-1/2 -translate-y-1/2 left-0 right-0 h-1.5 bg-gray-700 rounded-full overflow-hidden">
+                  {/* Clip color segments */}
                   {(() => {
                     let accumulated = 0
                     return project.timeline.map((item, i) => {
@@ -978,17 +1305,32 @@ export function VideoEditor() {
                       const widthPercent = (clipDuration / totalDuration) * 100
                       const leftPercent = (accumulated / totalDuration) * 100
                       accumulated += clipDuration
-                      const colors = ['bg-blue-500/30', 'bg-green-500/30', 'bg-purple-500/30', 'bg-orange-500/30']
+                      const colors = ['bg-blue-500/40', 'bg-green-500/40', 'bg-purple-500/40', 'bg-orange-500/40']
                       return (
                         <div
                           key={i}
-                          className={`absolute h-full ${colors[i % colors.length]} ${i === activeClipIndex ? 'ring-1 ring-white' : ''}`}
+                          className={`absolute h-full ${colors[i % colors.length]}`}
                           style={{ left: `${leftPercent}%`, width: `${widthPercent}%` }}
                         />
                       )
                     })
                   })()}
+                  {/* Progress bar */}
+                  <div
+                    className="absolute top-0 left-0 h-full bg-blue-500 rounded-full"
+                    style={{ width: `${totalDuration > 0 ? (currentTime / totalDuration) * 100 : 0}%` }}
+                  />
                 </div>
+                {/* Seek input (overlaid) */}
+                <input
+                  type="range"
+                  min="0"
+                  max={totalDuration || 1}
+                  step="0.1"
+                  value={currentTime}
+                  onChange={handleSeek}
+                  className="absolute top-0 left-0 w-full h-full appearance-none bg-transparent cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:bg-blue-500 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:shadow-md [&::-moz-range-thumb]:w-3 [&::-moz-range-thumb]:h-3 [&::-moz-range-thumb]:bg-blue-500 [&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:border-0 [&::-webkit-slider-runnable-track]:bg-transparent [&::-moz-range-track]:bg-transparent"
+                />
               </div>
 
               {/* Controls */}
@@ -1016,7 +1358,7 @@ export function VideoEditor() {
                 <div className="text-xs text-gray-400">
                   {formatTime(currentTime)} / {formatTime(totalDuration)}
                 </div>
-                <div className="flex items-center gap-1">
+                <div className="flex items-center gap-2">
                   {project.globalEffects.speed && project.globalEffects.speed !== 1 && (
                     <span className="text-xs px-1.5 py-0.5 rounded bg-blue-600/30 text-blue-300">
                       {project.globalEffects.speed}x
@@ -1027,6 +1369,24 @@ export function VideoEditor() {
                       {project.videos.length}本
                     </span>
                   )}
+                  <Button
+                    onClick={handleExport}
+                    size="sm"
+                    disabled={isExporting || isProcessing || project.timeline.length === 0}
+                    className="bg-green-600 hover:bg-green-700 h-7 text-xs px-2 disabled:opacity-50"
+                  >
+                    {isExporting ? (
+                      <>
+                        <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+                        処理中
+                      </>
+                    ) : (
+                      <>
+                        <Download className="h-3 w-3 mr-1" />
+                        保存
+                      </>
+                    )}
+                  </Button>
                 </div>
               </div>
 
@@ -1143,7 +1503,6 @@ export function VideoEditor() {
               <div className="bg-[#2f2f2f] rounded-2xl px-3 sm:px-4 py-2 sm:py-3 min-w-[180px] sm:min-w-[220px] md:min-w-[280px]">
                 <div className="flex items-center justify-between text-xs sm:text-sm text-gray-300 mb-2">
                   <span>{progress.message}</span>
-                  <span>{progress.progress}%</span>
                 </div>
                 <div className="w-full bg-gray-700 rounded-full h-1.5 sm:h-2">
                   <div
