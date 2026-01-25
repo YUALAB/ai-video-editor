@@ -644,7 +644,7 @@ WrapStyle: 0
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Sans,${fontSize},${primaryColor},&H000000FF,&H00000000,${backColor},0,0,0,0,100,100,0,0,3,2,1,${alignment},20,20,30,1
+Style: Default,Noto Sans CJK JP,${fontSize},${primaryColor},&H000000FF,&H00000000,${backColor},0,0,0,0,100,100,0,0,3,2,1,${alignment},20,20,30,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -791,7 +791,8 @@ export async function processProject(
       filters.push(`fade=t=in:st=0:d=${fadeDuration}`)
     }
 
-    // Add subtitles using drawtext filter
+    // Add subtitles using ASS format (libass is enabled in ffmpeg.wasm)
+    let assFilename: string | null = null
     if (project.subtitles && project.subtitles.segments.length > 0) {
       const { segments, style } = project.subtitles
       const clipStart = clip.startTime
@@ -804,15 +805,24 @@ export async function processProject(
 
       if (clipSubtitles.length > 0) {
         try {
-          // Build drawtext filters for each subtitle segment
-          const drawtextFilters = buildDrawtextFilters(clipSubtitles, clipStart, style, formatConfig)
-          if (drawtextFilters) {
-            filters.push(drawtextFilters)
-            console.log(`Added drawtext subtitles for clip ${i}:`, clipSubtitles.length, 'segments')
+          // Create ASS subtitle file
+          const assContent = generateASSContent(clipSubtitles, clipStart, style, formatConfig)
+          assFilename = `subs_${i}.ass`
+          await ff.writeFile(assFilename, assContent)
+          assFiles.push(assFilename)
+
+          // Use ASS filter with fontsdir option (requires libass which is enabled)
+          // Point to current directory where font.otf is located
+          if (fontLoaded) {
+            filters.push(`ass=${assFilename}:fontsdir=.`)
+          } else {
+            filters.push(`ass=${assFilename}`)
           }
+          console.log(`Added ASS subtitles for clip ${i}:`, clipSubtitles.length, 'segments', 'fontLoaded:', fontLoaded)
+          console.log('ASS content preview:', assContent.substring(0, 500))
         } catch (subError) {
           console.warn(`Failed to add subtitles for clip ${i}:`, subError)
-          // Continue without subtitles if it fails
+          assFilename = null
         }
       }
     }
@@ -869,8 +879,8 @@ export async function processProject(
     } catch (error) {
       console.error(`Failed to process clip ${i}:`, error)
 
-      // If subtitles/drawtext filter might have caused the error, retry without it
-      const hasSubtitlesFilter = filters.some(f => f.startsWith('subtitles=') || f.startsWith('drawtext='))
+      // If subtitles/ass/drawtext filter might have caused the error, retry without it
+      const hasSubtitlesFilter = filters.some(f => f.startsWith('subtitles=') || f.startsWith('drawtext=') || f.startsWith('ass='))
       if (hasSubtitlesFilter) {
         console.log('Retrying without subtitles filter...')
         const filtersWithoutSubs = filters.filter(f => !f.startsWith('subtitles='))
