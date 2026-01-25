@@ -92,7 +92,9 @@ export async function loadFFmpeg(
 export async function processVideo(
   inputFile: File,
   format: string,
-  onProgress?: (progress: ProcessingProgress) => void
+  onProgress?: (progress: ProcessingProgress) => void,
+  trimStart?: number,
+  trimEnd?: number
 ): Promise<Blob> {
   const ff = await loadFFmpeg(onProgress)
   const formatConfig = VIDEO_FORMATS[format] || VIDEO_FORMATS.tiktok
@@ -114,19 +116,36 @@ export async function processVideo(
     `pad=${formatConfig.width}:${formatConfig.height}:(ow-iw)/2:(oh-ih)/2:black`,
   ].join(',')
 
+  // Build ffmpeg command
+  const ffmpegArgs: string[] = []
+
+  // Add trim start if specified
+  if (trimStart !== undefined && trimStart > 0) {
+    ffmpegArgs.push('-ss', trimStart.toFixed(3))
+  }
+
+  ffmpegArgs.push('-i', 'input.mp4')
+
+  // Add duration if trim end is specified
+  if (trimEnd !== undefined && trimStart !== undefined && trimEnd > trimStart) {
+    const duration = trimEnd - trimStart
+    ffmpegArgs.push('-t', duration.toFixed(3))
+  }
+
+  ffmpegArgs.push(
+    '-vf', filterComplex,
+    '-c:v', 'libx264',
+    '-preset', 'fast',
+    '-crf', '28',
+    '-c:a', 'aac',
+    '-b:a', '128k',
+    '-movflags', '+faststart',
+    '-y',
+    'output.mp4'
+  )
+
   try {
-    await ff.exec([
-      '-i', 'input.mp4',
-      '-vf', filterComplex,
-      '-c:v', 'libx264',
-      '-preset', 'fast',
-      '-crf', '28',
-      '-c:a', 'aac',
-      '-b:a', '128k',
-      '-movflags', '+faststart',
-      '-y',
-      'output.mp4',
-    ])
+    await ff.exec(ffmpegArgs)
   } catch (error) {
     console.error('FFmpeg exec error:', error)
     throw new Error('動画の処理中にエラーが発生しました')
