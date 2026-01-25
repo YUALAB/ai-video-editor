@@ -43,7 +43,7 @@ const nextConfig: NextConfig = {
               "style-src 'self' 'unsafe-inline'",
               "img-src 'self' data: blob: https:",
               "font-src 'self' data:",
-              "connect-src 'self' https://*.supabase.co https://api.ollama.com wss://*.supabase.co",
+              "connect-src 'self' https://*.supabase.co https://api.ollama.com wss://*.supabase.co https://*.onrender.com",
               "media-src 'self' blob: data:",
               "frame-ancestors 'none'",
               "base-uri 'self'",
