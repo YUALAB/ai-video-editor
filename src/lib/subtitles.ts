@@ -45,12 +45,17 @@ async function getTranscriber(
 
   isLoading = true
 
+  // Mobile: use whisper-tiny Q8 (~45MB) to avoid OOM crash
+  // Desktop: use whisper-small Q8 (~249MB) for better accuracy
+  const isMobile = typeof navigator !== 'undefined' && /iPhone|iPad|iPod|Android/i.test(navigator.userAgent)
+  const modelName = isMobile ? 'Xenova/whisper-tiny' : 'Xenova/whisper-small'
+
   try {
-    onProgress?.(0, 'AIモデルを準備中...')
+    onProgress?.(0, isMobile ? '軽量AIモデルを準備中...' : 'AIモデルを準備中...')
 
     transcriber = await pipeline(
       'automatic-speech-recognition',
-      'Xenova/whisper-small',
+      modelName,
       {
         dtype: 'q8',
       }
@@ -59,24 +64,28 @@ async function getTranscriber(
     onProgress?.(30, '準備完了')
     return transcriber
   } catch (error) {
-    console.error('Failed to load whisper-small q8:', error)
-    // Fallback: try whisper-tiny (much smaller, works on low-memory devices)
-    try {
-      onProgress?.(0, '軽量モデルで再試行中...')
+    console.error(`Failed to load ${modelName} q8:`, error)
+    // Fallback: if whisper-small failed, try whisper-tiny
+    if (!isMobile) {
+      try {
+        onProgress?.(0, '軽量モデルで再試行中...')
 
-      transcriber = await pipeline(
-        'automatic-speech-recognition',
-        'Xenova/whisper-tiny',
-        {
-          dtype: 'q8',
-        }
-      )
-      onProgress?.(30, '準備完了')
-      return transcriber
-    } catch (fallbackError) {
-      isLoading = false
-      throw new Error('Whisperモデルの読み込みに失敗しました。メモリ不足の可能性があります。')
+        transcriber = await pipeline(
+          'automatic-speech-recognition',
+          'Xenova/whisper-tiny',
+          {
+            dtype: 'q8',
+          }
+        )
+        onProgress?.(30, '準備完了')
+        return transcriber
+      } catch (fallbackError) {
+        isLoading = false
+        throw new Error('Whisperモデルの読み込みに失敗しました。メモリ不足の可能性があります。')
+      }
     }
+    isLoading = false
+    throw new Error('Whisperモデルの読み込みに失敗しました。メモリ不足の可能性があります。')
   } finally {
     isLoading = false
   }
