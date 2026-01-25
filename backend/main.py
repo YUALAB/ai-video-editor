@@ -108,36 +108,36 @@ def validate_video_file(file: UploadFile) -> None:
 async def call_qwen_api(prompt: str, video_path: Optional[str] = None) -> str:
     """Call Qwen3-VL API for video analysis and editing instructions."""
     ollama_api_key = os.getenv("OLLAMA_API_KEY")
-    ollama_base_url = os.getenv("OLLAMA_BASE_URL", "https://api.ollama.com/v1")
+    ollama_base_url = os.getenv("OLLAMA_BASE_URL", "https://ollama.com/api")
 
     if not ollama_api_key:
         raise ValueError("OLLAMA_API_KEY is not configured")
 
+    system_prompt = """You are a video editing assistant. Based on the user's request,
+generate FFmpeg commands or editing instructions.
+Respond in JSON format with the following structure:
+{
+    "action": "cut|trim|text|filter|merge",
+    "params": { ... },
+    "ffmpeg_args": [ ... ]
+}"""
+
     async with httpx.AsyncClient(timeout=120.0) as client:
         response = await client.post(
-            f"{ollama_base_url}/chat/completions",
+            f"{ollama_base_url}/chat",
             headers={"Authorization": f"Bearer {ollama_api_key}"},
             json={
                 "model": "qwen3-vl:235b-cloud",
                 "messages": [
-                    {
-                        "role": "system",
-                        "content": """You are a video editing assistant. Based on the user's request,
-                        generate FFmpeg commands or editing instructions.
-                        Respond in JSON format with the following structure:
-                        {
-                            "action": "cut|trim|text|filter|merge",
-                            "params": { ... },
-                            "ffmpeg_args": [ ... ]
-                        }"""
-                    },
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": prompt}
                 ],
+                "stream": False,
             },
         )
         response.raise_for_status()
         data = response.json()
-        return data["choices"][0]["message"]["content"]
+        return data.get("message", {}).get("content", "")
 
 
 async def process_video(job_id: str, video_path: str, prompt: str, output_format: str):
