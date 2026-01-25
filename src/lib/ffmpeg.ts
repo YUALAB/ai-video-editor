@@ -644,7 +644,7 @@ WrapStyle: 0
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Noto Sans CJK JP,${fontSize},${primaryColor},&H000000FF,&H00000000,${backColor},0,0,0,0,100,100,0,0,3,2,1,${alignment},20,20,30,1
+Style: Default,Noto Sans CJK JP,${fontSize},${primaryColor},&H000000FF,&H00000000,${backColor},0,0,0,0,100,100,0,0,3,2,1,${alignment},20,20,50,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -742,9 +742,16 @@ export async function processProject(
     // Build filter for this clip
     const filters: string[] = []
 
-    // Scale to target format
+    // Scale to target format (pad will be added later, after subtitles)
     filters.push(
-      `scale=${formatConfig.width}:${formatConfig.height}:force_original_aspect_ratio=decrease`,
+      `scale=${formatConfig.width}:${formatConfig.height}:force_original_aspect_ratio=decrease`
+    )
+
+    // Placeholder for subtitle filter (will be inserted here before pad)
+    const subtitleFilterIndex = filters.length
+
+    // Add padding after scale (and after subtitles when they're added)
+    filters.push(
       `pad=${formatConfig.width}:${formatConfig.height}:(ow-iw)/2:(oh-ih)/2:black`
     )
 
@@ -812,12 +819,9 @@ export async function processProject(
           assFiles.push(assFilename)
 
           // Use ASS filter with fontsdir option (requires libass which is enabled)
-          // Point to current directory where font.otf is located
-          if (fontLoaded) {
-            filters.push(`ass=${assFilename}:fontsdir=.`)
-          } else {
-            filters.push(`ass=${assFilename}`)
-          }
+          // Insert BEFORE pad filter (at subtitleFilterIndex position)
+          const assFilter = fontLoaded ? `ass=${assFilename}:fontsdir=.` : `ass=${assFilename}`
+          filters.splice(subtitleFilterIndex, 0, assFilter)
           console.log(`Added ASS subtitles for clip ${i}:`, clipSubtitles.length, 'segments', 'fontLoaded:', fontLoaded)
           console.log('ASS content preview:', assContent.substring(0, 500))
         } catch (subError) {
