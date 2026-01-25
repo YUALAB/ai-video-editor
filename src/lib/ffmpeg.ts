@@ -114,12 +114,9 @@ let fontLoaded = false
 let fontFilename = 'font.ttf'
 
 // Font URL - using a Japanese-capable font from reliable CDN
-// Using smaller subset fonts for faster loading
+// Noto Sans CJK JP - full Japanese support (~16MB, but reliable)
 const FONT_URLS = [
-  // Kosugi Maru - compact Japanese font (~2MB)
-  'https://cdn.jsdelivr.net/gh/nicholaswmin/google-webfonts-helper@master/fonts/kosugi-maru/kosugi-maru-v14-japanese-regular.ttf',
-  // M PLUS 1p - another Japanese font
-  'https://cdn.jsdelivr.net/gh/nicholaswmin/google-webfonts-helper@master/fonts/m-plus-1p/m-plus-1p-v28-japanese-regular.ttf',
+  'https://cdn.jsdelivr.net/gh/notofonts/noto-cjk@main/Sans/OTF/Japanese/NotoSansCJKjp-Regular.otf',
 ]
 
 // CDN URL for core files
@@ -157,7 +154,9 @@ async function loadFontToFFmpeg(ff: FFmpeg): Promise<boolean> {
       }
 
       // Determine extension from URL
-      const ext = fontUrl.includes('.woff') ? 'woff' : 'ttf'
+      let ext = 'ttf'
+      if (fontUrl.includes('.woff')) ext = 'woff'
+      else if (fontUrl.includes('.otf')) ext = 'otf'
       fontFilename = `font.${ext}`
       await ff.writeFile(fontFilename, new Uint8Array(fontData))
       fontLoaded = true
@@ -870,8 +869,8 @@ export async function processProject(
     } catch (error) {
       console.error(`Failed to process clip ${i}:`, error)
 
-      // If subtitles filter might have caused the error, retry without it
-      const hasSubtitlesFilter = filters.some(f => f.startsWith('subtitles='))
+      // If subtitles/drawtext filter might have caused the error, retry without it
+      const hasSubtitlesFilter = filters.some(f => f.startsWith('subtitles=') || f.startsWith('drawtext='))
       if (hasSubtitlesFilter) {
         console.log('Retrying without subtitles filter...')
         const filtersWithoutSubs = filters.filter(f => !f.startsWith('subtitles='))
