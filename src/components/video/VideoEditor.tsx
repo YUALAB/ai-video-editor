@@ -724,6 +724,15 @@ export function VideoEditor() {
       return
     }
 
+    // Check SharedArrayBuffer availability (required for FFmpeg WASM)
+    if (typeof SharedArrayBuffer === 'undefined') {
+      setAiMessages(prev => [...prev, {
+        role: 'ai',
+        text: 'このブラウザではエクスポートできません。\nChrome、Safari、またはFirefoxの最新版をお使いください。\n\n（技術的理由: SharedArrayBufferが利用できません）'
+      }])
+      return
+    }
+
     setIsExporting(true)
     setIsProcessing(true)
     setError(null)
@@ -731,14 +740,19 @@ export function VideoEditor() {
     setProgress({ progress: 0, message: 'エクスポート準備中...' })
 
     try {
-      setAiMessages(prev => [...prev, { role: 'ai', text: 'フレームを書き出し中...\n（高画質で出力されます）' }])
-      const FPS = 30
+      const isMobileDevice = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent)
+      setAiMessages(prev => [...prev, { role: 'ai', text: isMobileDevice ? 'フレームを書き出し中...\n（モバイル最適化で出力）' : 'フレームを書き出し中...\n（高画質で出力されます）' }])
+      // Mobile: lower FPS + JPEG to reduce memory usage; Desktop: full quality PNG
+      const FPS = isMobileDevice ? 24 : 30
+      const frameFormat = isMobileDevice ? 'image/jpeg' : 'image/png'
+      const frameExt = isMobileDevice ? 'jpg' : 'png'
+      const frameQuality = isMobileDevice ? 0.98 : undefined // JPEG quality (PNG ignores this)
       const canvas = document.createElement('canvas')
       const ctx = canvas.getContext('2d')!
       ctx.imageSmoothingEnabled = true
       ctx.imageSmoothingQuality = 'high'
 
-      // Use original video resolution for best quality
+      // Use original video resolution for best quality (capped on mobile)
       const firstClip = project.clips.find(c => c.id === project.timeline[0].clipId)
       const firstVideo = firstClip ? project.videos.find(v => v.id === firstClip.sourceId) : null
       let nativeWidth = 1920
@@ -749,6 +763,18 @@ export function VideoEditor() {
         await new Promise<void>(r => { probeVideo.onloadedmetadata = () => r() })
         nativeWidth = probeVideo.videoWidth
         nativeHeight = probeVideo.videoHeight
+      }
+      // Mobile: cap at 720p to prevent memory exhaustion
+      if (isMobileDevice) {
+        const maxDim = 1280
+        if (nativeWidth > maxDim || nativeHeight > maxDim) {
+          const scale = maxDim / Math.max(nativeWidth, nativeHeight)
+          nativeWidth = Math.round(nativeWidth * scale)
+          nativeHeight = Math.round(nativeHeight * scale)
+          // Ensure even dimensions (required by libx264)
+          nativeWidth = nativeWidth % 2 === 0 ? nativeWidth : nativeWidth + 1
+          nativeHeight = nativeHeight % 2 === 0 ? nativeHeight : nativeHeight + 1
+        }
       }
       canvas.width = nativeWidth
       canvas.height = nativeHeight
@@ -868,20 +894,23 @@ export function VideoEditor() {
             ctx.fillText(currentSub.text, canvas.width / 2, textY)
           }
 
-          // Export frame as PNG (lossless)
+          // Export frame (PNG on desktop for lossless, JPEG 98% on mobile for memory)
           const blob = await new Promise<Blob>((resolve) => {
-            canvas.toBlob((b) => resolve(b!), 'image/png')
+            canvas.toBlob((b) => resolve(b!), frameFormat, frameQuality)
           })
           const frameData = new Uint8Array(await blob.arrayBuffer())
-          const frameName = `frame_${String(frameIndex).padStart(6, '0')}.png`
+          const frameName = `frame_${String(frameIndex).padStart(6, '0')}.${frameExt}`
           await ff.writeFile(frameName, frameData)
 
           frameIndex++
 
           // Update progress (10-70% for frame rendering)
-          if (frameIndex % 5 === 0) {
+          const updateInterval = isMobileDevice ? 3 : 5
+          if (frameIndex % updateInterval === 0) {
             const pct = 10 + Math.round((frameIndex / totalFrames) * 60)
             setProgress({ progress: pct, message: `フレーム ${frameIndex}/${totalFrames}` })
+            // Yield to browser to prevent tab from being killed on mobile
+            await new Promise(r => setTimeout(r, 0))
           }
         }
       }
@@ -943,7 +972,7 @@ export function VideoEditor() {
       // Encode frames to MP4
       const encodeArgs = [
         '-framerate', String(FPS),
-        '-i', 'frame_%06d.png'
+        '-i', `frame_%06d.${frameExt}`
       ]
 
       if (finalAudioFile && !project.globalEffects.mute) {
@@ -980,7 +1009,7 @@ export function VideoEditor() {
 
       // Cleanup FFmpeg files
       for (let i = 0; i < frameIndex; i++) {
-        try { await ff.deleteFile(`frame_${String(i).padStart(6, '0')}.png`) } catch { /* ignore */ }
+        try { await ff.deleteFile(`frame_${String(i).padStart(6, '0')}.${frameExt}`) } catch { /* ignore */ }
       }
       for (const af of audioFiles) {
         try { await ff.deleteFile(af) } catch { /* ignore */ }
@@ -994,17 +1023,41 @@ export function VideoEditor() {
       // Download
       const fileName = `edited_${format}_${Date.now()}.mp4`
       const url = URL.createObjectURL(outputBlob)
-      const isMobileDevice = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent)
 
-      if (isMobileDevice && navigator.share) {
-        try {
-          const file = new File([outputBlob], fileName, { type: 'video/mp4' })
-          await navigator.share({ files: [file] })
-          setAiMessages(prev => [...prev, { role: 'ai', text: 'エクスポート完了！' }])
-        } catch {
-          window.open(url, '_blank')
-          setAiMessages(prev => [...prev, { role: 'ai', text: 'エクスポート完了！新しいタブで開きました。' }])
+      if (isMobileDevice) {
+        // Mobile: try navigator.share first (most reliable on iOS/Android)
+        let saved = false
+        if (navigator.share && navigator.canShare) {
+          try {
+            const file = new File([outputBlob], fileName, { type: 'video/mp4' })
+            if (navigator.canShare({ files: [file] })) {
+              await navigator.share({ files: [file] })
+              saved = true
+              setAiMessages(prev => [...prev, { role: 'ai', text: 'エクスポート完了！' }])
+            }
+          } catch (shareErr) {
+            console.warn('Share failed:', shareErr)
+          }
         }
+        if (!saved) {
+          // Fallback: open blob URL in new tab (user can long-press to save)
+          const w = window.open(url, '_blank')
+          if (w) {
+            setAiMessages(prev => [...prev, { role: 'ai', text: 'エクスポート完了！\n新しいタブで動画が開きます。長押しで保存してください。' }])
+          } else {
+            // If popup blocked, create download link
+            const a = document.createElement('a')
+            a.href = url
+            a.download = fileName
+            a.target = '_blank'
+            document.body.appendChild(a)
+            a.click()
+            document.body.removeChild(a)
+            setAiMessages(prev => [...prev, { role: 'ai', text: 'エクスポート完了！ダウンロードが開始されました。' }])
+          }
+        }
+        // Keep URL alive longer on mobile
+        setTimeout(() => URL.revokeObjectURL(url), 60000)
       } else {
         const a = document.createElement('a')
         a.href = url
@@ -1013,9 +1066,8 @@ export function VideoEditor() {
         a.click()
         document.body.removeChild(a)
         setAiMessages(prev => [...prev, { role: 'ai', text: 'エクスポート完了！ダウンロードが開始されました。' }])
+        setTimeout(() => URL.revokeObjectURL(url), 5000)
       }
-
-      setTimeout(() => URL.revokeObjectURL(url), 1000)
 
     } catch (err) {
       console.error('Export error:', err)
