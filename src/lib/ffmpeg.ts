@@ -23,9 +23,26 @@ let ffmpegInstance: any = null
 let ffmpegLoaded = false
 let FFmpegClass: any = null
 
+// CDN URLs
+const FFMPEG_VERSION = '0.12.10'
+const CORE_VERSION = '0.12.6'
+const FFMPEG_BASE = `https://unpkg.com/@ffmpeg/ffmpeg@${FFMPEG_VERSION}/dist/esm`
+const CORE_BASE = `https://unpkg.com/@ffmpeg/core@${CORE_VERSION}/dist/esm`
+
+/**
+ * Fetch a script and convert to blob URL
+ */
+async function fetchAsBlob(url: string, type: string): Promise<string> {
+  const response = await fetch(url)
+  if (!response.ok) {
+    throw new Error(`Failed to fetch ${url}`)
+  }
+  const blob = await response.blob()
+  return URL.createObjectURL(new Blob([blob], { type }))
+}
+
 /**
  * Dynamic import that bypasses webpack/turbopack bundling
- * Uses Function constructor to avoid static analysis
  */
 async function dynamicImportFromURL(url: string): Promise<any> {
   const importFn = new Function('url', 'return import(url)')
@@ -40,9 +57,9 @@ async function getFFmpegClass(): Promise<any> {
     return FFmpegClass
   }
 
-  const module = await dynamicImportFromURL(
-    'https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/esm/index.js'
-  )
+  // Fetch FFmpeg main module and create blob URL
+  const ffmpegBlobURL = await fetchAsBlob(`${FFMPEG_BASE}/index.js`, 'text/javascript')
+  const module = await dynamicImportFromURL(ffmpegBlobURL)
 
   FFmpegClass = module.FFmpeg
   return FFmpegClass
@@ -77,30 +94,19 @@ export async function loadFFmpeg(
 
     onProgress?.({ progress: 5, message: 'FFmpegコアを読み込み中...' })
 
-    // Load FFmpeg core from CDN
-    const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm'
-
-    // Fetch and create blob URLs for core files
-    const [coreResponse, wasmResponse] = await Promise.all([
-      fetch(`${baseURL}/ffmpeg-core.js`),
-      fetch(`${baseURL}/ffmpeg-core.wasm`),
+    // Fetch all required files and create blob URLs
+    const [coreURL, wasmURL, workerURL] = await Promise.all([
+      fetchAsBlob(`${CORE_BASE}/ffmpeg-core.js`, 'text/javascript'),
+      fetchAsBlob(`${CORE_BASE}/ffmpeg-core.wasm`, 'application/wasm'),
+      fetchAsBlob(`${FFMPEG_BASE}/worker.js`, 'text/javascript'),
     ])
-
-    if (!coreResponse.ok || !wasmResponse.ok) {
-      throw new Error('Failed to fetch FFmpeg core files')
-    }
-
-    const coreBlob = await coreResponse.blob()
-    const wasmBlob = await wasmResponse.blob()
-
-    const coreURL = URL.createObjectURL(new Blob([coreBlob], { type: 'text/javascript' }))
-    const wasmURL = URL.createObjectURL(new Blob([wasmBlob], { type: 'application/wasm' }))
 
     onProgress?.({ progress: 8, message: 'FFmpegを初期化中...' })
 
     await ffmpegInstance.load({
       coreURL,
       wasmURL,
+      workerURL,
     })
 
     ffmpegLoaded = true
