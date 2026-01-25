@@ -1,21 +1,14 @@
 'use client'
 
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useCallback, useEffect } from 'react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Textarea } from '@/components/ui/textarea'
 import { VideoFormat } from '@/schemas/video'
-import { Upload, Wand2, Download, Loader2, CheckCircle, XCircle } from 'lucide-react'
+import { Upload, Wand2, Download, Loader2, CheckCircle, XCircle, AlertTriangle } from 'lucide-react'
+import { processVideo, isFFmpegSupported, type ProcessingProgress } from '@/lib/ffmpeg'
 
-interface JobStatus {
-  id: string
-  status: 'pending' | 'processing' | 'completed' | 'failed'
-  progress: number
-  output_url?: string
-  error?: string
-}
-
-const MAX_FILE_SIZE_MB = 500
+const MAX_FILE_SIZE_MB = 200
 const MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024
 
 export function VideoEditor() {
@@ -24,10 +17,11 @@ export function VideoEditor() {
   const [file, setFile] = useState<File | null>(null)
   const [fileError, setFileError] = useState<string | null>(null)
   const [isProcessing, setIsProcessing] = useState(false)
-  const [jobId, setJobId] = useState<string | null>(null)
-  const [jobStatus, setJobStatus] = useState<JobStatus | null>(null)
+  const [progress, setProgress] = useState<ProcessingProgress | null>(null)
+  const [outputUrl, setOutputUrl] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
   const [dragActive, setDragActive] = useState(false)
-  const [backendError, setBackendError] = useState<string | null>(null)
+  const [isSupported, setIsSupported] = useState(true)
 
   const formats: { value: VideoFormat; label: string; aspect: string }[] = [
     { value: 'tiktok', label: 'TikTok', aspect: '9:16' },
@@ -36,43 +30,14 @@ export function VideoEditor() {
     { value: 'landscape', label: 'Landscape', aspect: '16:9' },
   ]
 
-  // Poll for job status
   useEffect(() => {
-    if (!jobId || jobStatus?.status === 'completed' || jobStatus?.status === 'failed') {
-      return
-    }
-
-    const interval = setInterval(async () => {
-      try {
-        const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || ''
-        const response = await fetch(`${backendUrl}/api/status/${jobId}`)
-        if (response.ok) {
-          const data = await response.json() as JobStatus
-          setJobStatus(data)
-          if (data.status === 'completed' || data.status === 'failed') {
-            setIsProcessing(false)
-          }
-        }
-      } catch (error) {
-        console.error('Error polling status:', error)
-      }
-    }, 2000)
-
-    return () => clearInterval(interval)
-  }, [jobId, jobStatus?.status])
-
-  const handleDrag = useCallback((e: React.DragEvent) => {
-    e.preventDefault()
-    e.stopPropagation()
-    if (e.type === 'dragenter' || e.type === 'dragover') {
-      setDragActive(true)
-    } else if (e.type === 'dragleave') {
-      setDragActive(false)
-    }
+    setIsSupported(isFFmpegSupported())
   }, [])
 
   const validateAndSetFile = useCallback((selectedFile: File) => {
     setFileError(null)
+    setError(null)
+    setOutputUrl(null)
 
     if (!selectedFile.type.startsWith('video/')) {
       setFileError('動画ファイルのみアップロードできます')
@@ -85,6 +50,16 @@ export function VideoEditor() {
     }
 
     setFile(selectedFile)
+  }, [])
+
+  const handleDrag = useCallback((e: React.DragEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    if (e.type === 'dragenter' || e.type === 'dragover') {
+      setDragActive(true)
+    } else if (e.type === 'dragleave') {
+      setDragActive(false)
+    }
   }, [])
 
   const handleDrop = useCallback((e: React.DragEvent) => {
@@ -104,72 +79,71 @@ export function VideoEditor() {
   }
 
   const handleSubmit = async () => {
-    if (!prompt || !file) return
-
-    const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL
-
-    if (!backendUrl) {
-      setBackendError('バックエンドサーバーが設定されていません。管理者にお問い合わせください。')
-      return
-    }
+    if (!file) return
 
     setIsProcessing(true)
-    setJobStatus(null)
-    setBackendError(null)
+    setError(null)
+    setOutputUrl(null)
+    setProgress({ progress: 0, message: '準備中...' })
 
     try {
-      const formData = new FormData()
-      formData.append('prompt', prompt)
-      formData.append('format', format)
-      formData.append('video', file)
+      const outputBlob = await processVideo(
+        file,
+        format,
+        (p) => setProgress(p)
+      )
 
-      const response = await fetch(`${backendUrl}/api/edit`, {
-        method: 'POST',
-        body: formData,
-      })
-
-      if (!response.ok) {
-        let errorMessage = 'サーバーエラーが発生しました'
-
-        if (response.status === 413) {
-          errorMessage = 'ファイルサイズが大きすぎます'
-        } else if (response.status === 429) {
-          errorMessage = 'リクエストが多すぎます。しばらく待ってから再試行してください'
-        } else {
-          try {
-            const errorData = await response.json()
-            errorMessage = errorData.error || errorData.detail || errorMessage
-          } catch {
-            // Response is not JSON, use default message
-          }
-        }
-
-        throw new Error(errorMessage)
-      }
-
-      const data = await response.json() as { id: string }
-      setJobId(data.id)
-      setJobStatus({ id: data.id, status: 'pending', progress: 0 })
-    } catch (error) {
-      console.error('Error:', error)
+      const url = URL.createObjectURL(outputBlob)
+      setOutputUrl(url)
+      setProgress({ progress: 100, message: '完了!' })
+    } catch (err) {
+      console.error('Processing error:', err)
+      setError(err instanceof Error ? err.message : '処理中にエラーが発生しました')
+      setProgress(null)
+    } finally {
       setIsProcessing(false)
-      setJobStatus({
-        id: '',
-        status: 'failed',
-        progress: 0,
-        error: error instanceof Error ? error.message : '処理を開始できませんでした'
-      })
     }
   }
 
   const handleReset = () => {
+    if (outputUrl) {
+      URL.revokeObjectURL(outputUrl)
+    }
     setFile(null)
     setFileError(null)
     setPrompt('')
-    setJobId(null)
-    setJobStatus(null)
+    setProgress(null)
+    setOutputUrl(null)
+    setError(null)
     setIsProcessing(false)
-    setBackendError(null)
+  }
+
+  const handleDownload = () => {
+    if (!outputUrl) return
+
+    const a = document.createElement('a')
+    a.href = outputUrl
+    a.download = `edited_${format}_${Date.now()}.mp4`
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+  }
+
+  if (!isSupported) {
+    return (
+      <div className="container mx-auto p-4 max-w-4xl">
+        <Card className="shadow-lg">
+          <CardContent className="p-8 text-center">
+            <AlertTriangle className="h-16 w-16 mx-auto text-yellow-500 mb-4" />
+            <h2 className="text-xl font-bold mb-2">ブラウザがサポートされていません</h2>
+            <p className="text-gray-600">
+              このアプリはSharedArrayBufferが必要です。
+              Chrome、Firefox、またはEdgeの最新版をお使いください。
+            </p>
+          </CardContent>
+        </Card>
+      </div>
+    )
   }
 
   return (
@@ -181,7 +155,7 @@ export function VideoEditor() {
             AI Video Editor
           </CardTitle>
           <CardDescription className="text-purple-100">
-            動画をアップロードして、AIに編集を指示してください
+            動画をアップロードして、フォーマットを選択してください
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-6 p-6">
@@ -216,7 +190,7 @@ export function VideoEditor() {
               <p className="text-sm text-gray-500 mt-1">
                 {file
                   ? `${(file.size / 1024 / 1024).toFixed(2)} MB`
-                  : 'クリックまたはドラッグ＆ドロップ'}
+                  : `クリックまたはドラッグ＆ドロップ（最大${MAX_FILE_SIZE_MB}MB）`}
               </p>
               {fileError && (
                 <p className="text-sm text-red-600 mt-2 flex items-center justify-center gap-1">
@@ -226,16 +200,6 @@ export function VideoEditor() {
               )}
             </label>
           </div>
-
-          {/* Backend Error */}
-          {backendError && (
-            <div className="p-4 bg-red-50 border border-red-200 rounded-lg">
-              <p className="text-red-700 flex items-center gap-2">
-                <XCircle className="h-5 w-5" />
-                {backendError}
-              </p>
-            </div>
-          )}
 
           {/* Format Selection */}
           <div>
@@ -256,49 +220,48 @@ export function VideoEditor() {
             </div>
           </div>
 
-          {/* Prompt Input */}
+          {/* Prompt Input (for future AI features) */}
           <div>
-            <label className="block text-sm font-medium mb-2">編集指示</label>
+            <label className="block text-sm font-medium mb-2">編集指示（オプション）</label>
             <Textarea
-              placeholder="例: 最初の10秒をカットして、テキスト「こんにちは」を中央に追加して、BGMを入れて"
+              placeholder="例: 明るくして、テキストを追加して（将来のAI機能用）"
               value={prompt}
               onChange={(e) => setPrompt(e.target.value)}
-              rows={4}
+              rows={3}
               disabled={isProcessing}
               className="resize-none"
             />
             <p className="text-xs text-gray-500 mt-1">
-              具体的な指示を書くほど、より正確な結果が得られます
+              現在はフォーマット変換のみ対応。AI編集機能は近日公開予定。
             </p>
           </div>
 
           {/* Progress */}
-          {jobStatus && (
+          {progress && (
             <div className="p-4 rounded-lg bg-gray-50">
               <div className="flex items-center justify-between mb-2">
-                <span className="text-sm font-medium">
-                  {jobStatus.status === 'pending' && '準備中...'}
-                  {jobStatus.status === 'processing' && '処理中...'}
-                  {jobStatus.status === 'completed' && '完了！'}
-                  {jobStatus.status === 'failed' && 'エラー'}
-                </span>
-                <span className="text-sm text-gray-500">{jobStatus.progress}%</span>
+                <span className="text-sm font-medium">{progress.message}</span>
+                <span className="text-sm text-gray-500">{progress.progress}%</span>
               </div>
               <div className="w-full bg-gray-200 rounded-full h-2">
                 <div
-                  className={`h-2 rounded-full transition-all duration-500 ${
-                    jobStatus.status === 'failed' ? 'bg-red-500' :
-                    jobStatus.status === 'completed' ? 'bg-green-500' : 'bg-purple-600'
+                  className={`h-2 rounded-full transition-all duration-300 ${
+                    error ? 'bg-red-500' :
+                    progress.progress === 100 ? 'bg-green-500' : 'bg-purple-600'
                   }`}
-                  style={{ width: `${jobStatus.progress}%` }}
+                  style={{ width: `${progress.progress}%` }}
                 />
               </div>
-              {jobStatus.error && (
-                <p className="text-red-600 text-sm mt-2 flex items-center gap-1">
-                  <XCircle className="h-4 w-4" />
-                  {jobStatus.error}
-                </p>
-              )}
+            </div>
+          )}
+
+          {/* Error */}
+          {error && (
+            <div className="p-4 bg-red-50 border border-red-200 rounded-lg">
+              <p className="text-red-700 flex items-center gap-2">
+                <XCircle className="h-5 w-5" />
+                {error}
+              </p>
             </div>
           )}
 
@@ -306,7 +269,7 @@ export function VideoEditor() {
           <div className="flex gap-3">
             <Button
               onClick={handleSubmit}
-              disabled={!prompt || !file || isProcessing}
+              disabled={!file || isProcessing}
               className="flex-1 bg-purple-600 hover:bg-purple-700"
               size="lg"
             >
@@ -318,11 +281,11 @@ export function VideoEditor() {
               ) : (
                 <>
                   <Wand2 className="h-4 w-4 mr-2" />
-                  AIで編集する
+                  変換する
                 </>
               )}
             </Button>
-            {(jobStatus || file) && (
+            {(file || outputUrl) && (
               <Button
                 variant="outline"
                 onClick={handleReset}
@@ -334,17 +297,23 @@ export function VideoEditor() {
           </div>
 
           {/* Output */}
-          {jobStatus?.status === 'completed' && jobStatus.output_url && (
+          {outputUrl && (
             <div className="mt-6 p-4 bg-green-50 rounded-lg border border-green-200">
               <p className="text-green-800 font-medium mb-3 flex items-center gap-2">
                 <CheckCircle className="h-5 w-5" />
-                編集完了！
+                変換完了!
               </p>
-              <Button asChild className="bg-green-600 hover:bg-green-700">
-                <a href={jobStatus.output_url} download>
-                  <Download className="h-4 w-4 mr-2" />
-                  ダウンロード
-                </a>
+              <video
+                src={outputUrl}
+                controls
+                className="w-full max-h-64 rounded-lg mb-3 bg-black"
+              />
+              <Button
+                onClick={handleDownload}
+                className="bg-green-600 hover:bg-green-700"
+              >
+                <Download className="h-4 w-4 mr-2" />
+                ダウンロード
               </Button>
             </div>
           )}
@@ -354,21 +323,21 @@ export function VideoEditor() {
       {/* Features */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mt-8">
         <Card className="p-4">
-          <h3 className="font-semibold mb-2">🎬 動画理解</h3>
+          <h3 className="font-semibold mb-2">🎬 ブラウザ内処理</h3>
           <p className="text-sm text-gray-600">
-            AIが動画の内容を分析して、最適な編集を提案
+            サーバー不要！あなたのブラウザで直接処理
           </p>
         </Card>
         <Card className="p-4">
-          <h3 className="font-semibold mb-2">✨ 自然言語指示</h3>
+          <h3 className="font-semibold mb-2">🔒 プライバシー保護</h3>
           <p className="text-sm text-gray-600">
-            「面白いところだけ切り抜いて」など自然な日本語でOK
+            動画はあなたのデバイスから出ません
           </p>
         </Card>
         <Card className="p-4">
           <h3 className="font-semibold mb-2">📱 マルチフォーマット</h3>
           <p className="text-sm text-gray-600">
-            TikTok、YouTube、Instagramなど各プラットフォームに対応
+            TikTok、YouTube、Instagramなどに対応
           </p>
         </Card>
       </div>
