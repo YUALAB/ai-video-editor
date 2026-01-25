@@ -1,6 +1,6 @@
 'use client'
 
-import { pipeline } from '@huggingface/transformers'
+import { pipeline, env } from '@huggingface/transformers'
 
 export interface SubtitleSegment {
   id: string
@@ -51,6 +51,15 @@ async function getTranscriber(
   const modelName = isMobile ? 'Xenova/whisper-tiny' : 'Xenova/whisper-small'
 
   try {
+    // Self-host ONNX WASM files to avoid COEP blocking cross-origin dynamic imports (iOS Safari)
+    if (env.backends?.onnx?.wasm) {
+      env.backends.onnx.wasm.wasmPaths = '/'
+      // Mobile: force single-threaded WASM to avoid Worker spawn failures
+      if (isMobile) {
+        env.backends.onnx.wasm.numThreads = 1
+      }
+    }
+
     onProgress?.(0, isMobile ? '軽量AIモデルを準備中...' : 'AIモデルを準備中...')
 
     transcriber = await pipeline(
@@ -92,7 +101,7 @@ async function getTranscriber(
 }
 
 // Extract audio from video and resample to 16kHz mono
-async function extractAudioFromVideo(videoUrl: string): Promise<Float32Array> {
+async function extractAudioFromVideo(videoUrl: string, preCreatedAudioContext?: AudioContext): Promise<Float32Array> {
   console.log('Extracting audio from:', videoUrl)
 
   try {
@@ -101,8 +110,13 @@ async function extractAudioFromVideo(videoUrl: string): Promise<Float32Array> {
     const arrayBuffer = await response.arrayBuffer()
     console.log('Fetched audio data, size:', arrayBuffer.byteLength)
 
-    // Create audio context at original sample rate first
-    const audioContext = new AudioContext()
+    // Use pre-created AudioContext (for iOS Safari user gesture requirement)
+    // or create a new one (desktop)
+    const audioContext = preCreatedAudioContext || new AudioContext()
+    // Ensure the context is running (iOS may have it suspended)
+    if (audioContext.state === 'suspended') {
+      await audioContext.resume()
+    }
     const audioBuffer = await audioContext.decodeAudioData(arrayBuffer)
 
     console.log('Decoded audio:', {
@@ -145,11 +159,12 @@ async function extractAudioFromVideo(videoUrl: string): Promise<Float32Array> {
       }
 
       console.log('Resampled audio length:', resampled.length)
-      await audioContext.close()
+      // Only close if we created the context ourselves
+      if (!preCreatedAudioContext) await audioContext.close()
       return resampled
     }
 
-    await audioContext.close()
+    if (!preCreatedAudioContext) await audioContext.close()
     return monoData
   } catch (error) {
     console.error('Audio extraction failed:', error)
@@ -161,7 +176,8 @@ async function extractAudioFromVideo(videoUrl: string): Promise<Float32Array> {
 export async function generateSubtitles(
   videoUrl: string,
   language: string = 'ja',
-  onProgress?: (progress: number, message: string) => void
+  onProgress?: (progress: number, message: string) => void,
+  audioContext?: AudioContext
 ): Promise<SubtitleSegment[]> {
   onProgress?.(0, '字幕生成を開始...')
 
@@ -170,8 +186,8 @@ export async function generateSubtitles(
 
   onProgress?.(30, '音声を抽出中...')
 
-  // Extract audio from video
-  const audioData = await extractAudioFromVideo(videoUrl)
+  // Extract audio from video (pass pre-created AudioContext for iOS)
+  const audioData = await extractAudioFromVideo(videoUrl, audioContext)
 
   onProgress?.(50, '音声を認識中...')
 

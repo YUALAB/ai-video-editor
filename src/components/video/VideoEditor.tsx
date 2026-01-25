@@ -1088,6 +1088,11 @@ export function VideoEditor() {
   const handleGenerateSubtitles = async () => {
     if (project.videos.length === 0) return
 
+    // Create AudioContext immediately during user gesture (required for iOS Safari)
+    // Must be created BEFORE any async operations (model loading etc.)
+    const audioCtx = new AudioContext()
+    await audioCtx.resume()
+
     setIsGeneratingSubtitles(true)
     setSubtitleProgress({ progress: 0, message: '字幕生成を開始...' })
     setAiMessages(prev => [...prev, { role: 'ai', text: '字幕を生成しています...\n（初回はモデルのダウンロードに時間がかかります）' }])
@@ -1099,7 +1104,8 @@ export function VideoEditor() {
         'ja',
         (progress, message) => {
           setSubtitleProgress({ progress, message })
-        }
+        },
+        audioCtx
       )
 
       setSubtitles(segments)
@@ -1129,6 +1135,7 @@ export function VideoEditor() {
       }])
     } finally {
       setIsGeneratingSubtitles(false)
+      try { await audioCtx.close() } catch { /* ignore */ }
     }
   }
 
