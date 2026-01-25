@@ -607,9 +607,9 @@ function generateASSContent(
   style: SubtitleOptions['style'],
   formatConfig: VideoFormat
 ): string {
-  // Map font size
-  const fontSizeMap = { small: 36, medium: 52, large: 72 }
-  const fontSize = fontSizeMap[style.fontSize] || 52
+  // Map font size (scaled for 720p PlayRes)
+  const fontSizeMap = { small: 28, medium: 36, large: 48 }
+  const fontSize = fontSizeMap[style.fontSize] || 36
 
   // Map position to ASS alignment (numpad style)
   // 1,2,3 = bottom; 4,5,6 = middle; 7,8,9 = top
@@ -635,16 +635,21 @@ function generateASSContent(
   }
 
   // ASS header
+  // Use smaller PlayRes for better scaling with landscape videos
+  // Most videos are 16:9 or similar, so after scaling to 1080 width, height is ~600-800px
+  const playResX = 1080
+  const playResY = 720  // Approximate for landscape videos
+
   const header = `[Script Info]
 Title: Video Subtitles
 ScriptType: v4.00+
-PlayResX: ${formatConfig.width}
-PlayResY: ${formatConfig.height}
+PlayResX: ${playResX}
+PlayResY: ${playResY}
 WrapStyle: 0
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Noto Sans CJK JP,${fontSize},${primaryColor},&H000000FF,&H00000000,${backColor},0,0,0,0,100,100,0,0,3,2,1,${alignment},20,20,50,1
+Style: Default,Noto Sans CJK JP,${fontSize},${primaryColor},&H000000FF,&H00000000,${backColor},0,0,0,0,100,100,0,0,3,2,1,${alignment},20,20,30,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
