@@ -2,68 +2,138 @@
 
 import { useState, useCallback, useEffect, useRef } from 'react'
 import { Button } from '@/components/ui/button'
-import { VideoFormat } from '@/schemas/video'
 import {
-  Upload, Download, Loader2, CheckCircle, XCircle, AlertTriangle,
-  Play, Pause, Scissors, RotateCcw, Sparkles, Send, Menu, X,
-  Sun, Gauge, Volume2, VolumeX
+  Download, Loader2, AlertTriangle, Send, Plus, Film,
+  Play, Pause, SkipBack, Volume2, VolumeX
 } from 'lucide-react'
-import { processVideo, isFFmpegSupported, type ProcessingProgress, type VideoEffects } from '@/lib/ffmpeg'
+import {
+  processProject,
+  isFFmpegSupported,
+  getVideoDuration,
+  generateId,
+  createEmptyProject,
+  type ProcessingProgress,
+  type VideoEffects,
+  type Project,
+  type VideoSource,
+  type Clip,
+  type TimelineItem
+} from '@/lib/ffmpeg'
+import { callAI, extractVideoFrames, extractFramesForSceneAnalysis, type ConversationMessage } from '@/lib/ai'
+import {
+  generateSubtitles,
+  getCurrentSubtitle,
+  type SubtitleSegment,
+  type SubtitleStyle,
+  DEFAULT_SUBTITLE_STYLE
+} from '@/lib/subtitles'
 
 const MAX_FILE_SIZE_MB = 200
 const MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024
+const DEFAULT_API_KEY = 'ddd559c40b854464bdb2febcb26adde7.xcQXenBGBQW0ka8QcMa9TTxK'
 
-// AI command patterns
-const AI_COMMANDS = [
-  { pattern: /明るく|brightness.*up|brighter/i, effect: 'brightness', value: 0.1 },
-  { pattern: /暗く|brightness.*down|darker/i, effect: 'brightness', value: -0.1 },
-  { pattern: /コントラスト.*上|contrast.*up|more contrast/i, effect: 'contrast', value: 0.2 },
-  { pattern: /彩度.*上|saturation.*up|more color|鮮やか/i, effect: 'saturation', value: 0.3 },
-  { pattern: /彩度.*下|saturation.*down|less color|モノクロ/i, effect: 'saturation', value: -1 },
-  { pattern: /速く|speed.*up|faster|2倍速|倍速/i, effect: 'speed', value: 2 },
-  { pattern: /遅く|slow.*down|slower|スロー/i, effect: 'speed', value: 0.5 },
-  { pattern: /音.*消|mute|ミュート|無音/i, effect: 'mute', value: true },
-  { pattern: /反転|flip|ミラー|mirror/i, effect: 'flip', value: true },
-  { pattern: /回転|rotate|90度/i, effect: 'rotate', value: 90 },
-]
+type MessageType = {
+  role: 'user' | 'ai'
+  text?: string
+  video?: {
+    url: string
+    name: string
+    isOutput?: boolean
+    videoIndex?: number  // For multiple videos
+  }
+}
+
+// Preset values for CSS preview
+const PRESET_VALUES: Record<string, { brightness: number; contrast: number; saturation: number; sepia?: number }> = {
+  cinematic: { brightness: 0.95, contrast: 1.2, saturation: 0.85 },
+  retro: { brightness: 1.05, contrast: 0.9, saturation: 0.7, sepia: 0.3 },
+  warm: { brightness: 1.05, contrast: 1.05, saturation: 1.1 },
+  cool: { brightness: 1, contrast: 1.1, saturation: 0.9 },
+  vibrant: { brightness: 1.1, contrast: 1.15, saturation: 1.4 },
+  bw: { brightness: 1, contrast: 1.1, saturation: 0 },
+}
+
+// Convert effects to CSS filter string
+function effectsToCssFilter(effects: VideoEffects): string {
+  const filters: string[] = []
+  let brightness = 1
+  let contrast = 1
+  let saturation = 1
+  let sepia = 0
+
+  if (effects.preset && effects.preset !== 'none' && PRESET_VALUES[effects.preset]) {
+    const preset = PRESET_VALUES[effects.preset]
+    brightness = preset.brightness
+    contrast = preset.contrast
+    saturation = preset.saturation
+    sepia = preset.sepia || 0
+  }
+
+  if (effects.brightness !== undefined) brightness += effects.brightness
+  if (effects.contrast !== undefined) contrast *= effects.contrast
+  if (effects.saturation !== undefined) saturation *= effects.saturation
+
+  if (brightness !== 1) filters.push(`brightness(${brightness})`)
+  if (contrast !== 1) filters.push(`contrast(${contrast})`)
+  if (saturation !== 1) filters.push(`saturate(${saturation})`)
+  if (sepia > 0) filters.push(`sepia(${sepia})`)
+  if (effects.blur && effects.blur > 0) filters.push(`blur(${effects.blur}px)`)
+
+  return filters.length > 0 ? filters.join(' ') : 'none'
+}
+
+// Convert effects to CSS transform string
+function effectsToCssTransform(effects: VideoEffects): string {
+  const transforms: string[] = []
+  if (effects.flip) transforms.push('scaleX(-1)')
+  if (effects.rotate) transforms.push(`rotate(${effects.rotate}deg)`)
+  return transforms.length > 0 ? transforms.join(' ') : 'none'
+}
+
+// Get preset display name
+function getPresetName(preset: string): string {
+  const names: Record<string, string> = {
+    cinematic: 'シネマティック', retro: 'レトロ', warm: '暖色',
+    cool: '寒色', vibrant: 'ビビッド', bw: 'モノクロ',
+  }
+  return names[preset] || preset
+}
 
 export function VideoEditor() {
-  const [format, setFormat] = useState<VideoFormat>('tiktok')
-  const [file, setFile] = useState<File | null>(null)
-  const [fileError, setFileError] = useState<string | null>(null)
+  // Project state (multi-video support)
+  const [project, setProject] = useState<Project>(createEmptyProject())
+
   const [isProcessing, setIsProcessing] = useState(false)
   const [progress, setProgress] = useState<ProcessingProgress | null>(null)
-  const [outputUrl, setOutputUrl] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const [dragActive, setDragActive] = useState(false)
   const [isSupported, setIsSupported] = useState(true)
-
-  // Video preview states
-  const [previewUrl, setPreviewUrl] = useState<string | null>(null)
-  const [isPlaying, setIsPlaying] = useState(false)
-  const [currentTime, setCurrentTime] = useState(0)
-  const [duration, setDuration] = useState(0)
-  const [trimStart, setTrimStart] = useState(0)
-  const [trimEnd, setTrimEnd] = useState(0)
 
   // AI states
   const [aiPrompt, setAiPrompt] = useState('')
-  const [aiEffects, setAiEffects] = useState<VideoEffects>({})
-  const [aiMessages, setAiMessages] = useState<{role: 'user' | 'ai', text: string}[]>([])
+  const [aiMessages, setAiMessages] = useState<MessageType[]>([
+    { role: 'ai', text: 'こんにちは！動画編集AIです。\n\n左下の＋ボタンから動画を追加してください。\n追加した動画は自動的にタイムラインに入ります。\n\n例：「明るくして」「シネマティックに」「2倍速で」' }
+  ])
+  const [conversationHistory, setConversationHistory] = useState<ConversationMessage[]>([])
+  const [aiLoading, setAiLoading] = useState(false)
+  const [format, setFormat] = useState<string>('tiktok')
 
-  // Mobile states
-  const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
-  const [activePanel, setActivePanel] = useState<'media' | 'settings'>('settings')
+  // Preview states
+  const [isPlaying, setIsPlaying] = useState(false)
+  const [currentTime, setCurrentTime] = useState(0)
+  const [totalDuration, setTotalDuration] = useState(0)
+  const [activeClipIndex, setActiveClipIndex] = useState(0)
+  const [isMuted, setIsMuted] = useState(false)
 
-  const videoRef = useRef<HTMLVideoElement>(null)
+  // Subtitle states
+  const [subtitles, setSubtitles] = useState<SubtitleSegment[]>([])
+  const [subtitleStyle, setSubtitleStyle] = useState<SubtitleStyle>(DEFAULT_SUBTITLE_STYLE)
+  const [isGeneratingSubtitles, setIsGeneratingSubtitles] = useState(false)
+  const [subtitleProgress, setSubtitleProgress] = useState<{ progress: number; message: string } | null>(null)
+
   const chatEndRef = useRef<HTMLDivElement>(null)
-
-  const formats: { value: VideoFormat; label: string; aspect: string }[] = [
-    { value: 'tiktok', label: 'TikTok', aspect: '9:16' },
-    { value: 'youtube', label: 'YouTube', aspect: '16:9' },
-    { value: 'square', label: 'Square', aspect: '1:1' },
-    { value: 'landscape', label: 'Landscape', aspect: '16:9' },
-  ]
+  const inputRef = useRef<HTMLInputElement>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
+  const previewVideoRef = useRef<HTMLVideoElement>(null)
 
   useEffect(() => {
     setIsSupported(isFFmpegSupported())
@@ -73,588 +143,1085 @@ export function VideoEditor() {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [aiMessages])
 
+  // Calculate total timeline duration
+  useEffect(() => {
+    if (project.timeline.length === 0) {
+      setTotalDuration(0)
+      return
+    }
+
+    let total = 0
+    for (const item of project.timeline) {
+      const clip = project.clips.find(c => c.id === item.clipId)
+      if (clip) {
+        const clipDuration = (clip.endTime - clip.startTime) / (project.globalEffects.speed || 1)
+        total += clipDuration
+      }
+    }
+    setTotalDuration(total)
+  }, [project.timeline, project.clips, project.globalEffects.speed])
+
+  // Get current clip and time position for preview
+  const getCurrentPreviewState = useCallback(() => {
+    if (project.timeline.length === 0) return null
+
+    let accumulatedTime = 0
+    for (let i = 0; i < project.timeline.length; i++) {
+      const item = project.timeline[i]
+      const clip = project.clips.find(c => c.id === item.clipId)
+      if (!clip) continue
+
+      const clipDuration = (clip.endTime - clip.startTime) / (project.globalEffects.speed || 1)
+
+      if (currentTime < accumulatedTime + clipDuration) {
+        const video = project.videos.find(v => v.id === clip.sourceId)
+        const timeInClip = (currentTime - accumulatedTime) * (project.globalEffects.speed || 1) + clip.startTime
+        return {
+          clipIndex: i,
+          video,
+          clip,
+          timeInClip,
+          clipStartInTimeline: accumulatedTime,
+          clipEndInTimeline: accumulatedTime + clipDuration
+        }
+      }
+      accumulatedTime += clipDuration
+    }
+
+    // Return last clip if beyond end
+    const lastItem = project.timeline[project.timeline.length - 1]
+    const lastClip = project.clips.find(c => c.id === lastItem.clipId)
+    const lastVideo = lastClip ? project.videos.find(v => v.id === lastClip.sourceId) : null
+    return {
+      clipIndex: project.timeline.length - 1,
+      video: lastVideo,
+      clip: lastClip,
+      timeInClip: lastClip?.endTime || 0,
+      clipStartInTimeline: accumulatedTime,
+      clipEndInTimeline: accumulatedTime
+    }
+  }, [project, currentTime])
+
+  // Handle preview playback with requestAnimationFrame for smooth performance
+  useEffect(() => {
+    if (!isPlaying || project.timeline.length === 0) return
+
+    let animationId: number
+    let lastTime = performance.now()
+
+    const animate = (now: number) => {
+      const delta = (now - lastTime) / 1000 // Convert to seconds
+      lastTime = now
+
+      setCurrentTime(prev => {
+        const next = prev + delta
+        if (next >= totalDuration) {
+          setIsPlaying(false)
+          return 0
+        }
+        return next
+      })
+
+      animationId = requestAnimationFrame(animate)
+    }
+
+    animationId = requestAnimationFrame(animate)
+
+    return () => cancelAnimationFrame(animationId)
+  }, [isPlaying, totalDuration, project.timeline.length])
+
+  // Sync video element with current time (throttled for mobile performance)
+  const lastSyncRef = useRef(0)
+  useEffect(() => {
+    const state = getCurrentPreviewState()
+    if (!state || !previewVideoRef.current) return
+
+    const video = previewVideoRef.current
+    const now = performance.now()
+
+    // Update active clip index for display
+    if (state.clipIndex !== activeClipIndex) {
+      setActiveClipIndex(state.clipIndex)
+    }
+
+    // Throttle video sync to every 250ms for mobile performance
+    if (now - lastSyncRef.current > 250 || !isPlaying) {
+      lastSyncRef.current = now
+
+      // Sync video time only if significantly different
+      if (Math.abs(video.currentTime - state.timeInClip) > 0.5) {
+        video.currentTime = state.timeInClip
+      }
+    }
+
+    // Sync playback state
+    if (isPlaying && video.paused) {
+      video.play().catch(() => {})
+    } else if (!isPlaying && !video.paused) {
+      video.pause()
+    }
+
+    // Sync playback rate
+    const speed = project.globalEffects.speed || 1
+    if (video.playbackRate !== speed) {
+      video.playbackRate = speed
+    }
+  }, [currentTime, isPlaying, getCurrentPreviewState, activeClipIndex, project.globalEffects.speed])
+
+  const handlePlayPause = () => {
+    if (project.timeline.length === 0) return
+    setIsPlaying(!isPlaying)
+  }
+
+  const handleSeek = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const time = parseFloat(e.target.value)
+    setCurrentTime(time)
+    setIsPlaying(false)
+  }
+
+  const handleRestart = () => {
+    setCurrentTime(0)
+    setIsPlaying(false)
+  }
+
   const formatTime = (seconds: number) => {
     const mins = Math.floor(seconds / 60)
     const secs = Math.floor(seconds % 60)
-    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`
+    return `${mins}:${secs.toString().padStart(2, '0')}`
   }
 
-  const validateAndSetFile = useCallback((selectedFile: File) => {
-    setFileError(null)
+  // Add video to project
+  const addVideoToProject = useCallback(async (file: File) => {
     setError(null)
-    setOutputUrl(null)
 
-    if (!selectedFile.type.startsWith('video/')) {
-      setFileError('動画ファイルのみアップロードできます')
+    if (!file.type.startsWith('video/')) {
+      setError('動画ファイルのみアップロードできます')
       return
     }
 
-    if (selectedFile.size > MAX_FILE_SIZE) {
-      setFileError(`ファイルサイズは${MAX_FILE_SIZE_MB}MB以下にしてください`)
+    if (file.size > MAX_FILE_SIZE) {
+      setError(`ファイルサイズは${MAX_FILE_SIZE_MB}MB以下にしてください`)
       return
     }
-
-    setFile(selectedFile)
-    const url = URL.createObjectURL(selectedFile)
-    setPreviewUrl(url)
-  }, [])
-
-  const handleDrag = useCallback((e: React.DragEvent) => {
-    e.preventDefault()
-    e.stopPropagation()
-    if (e.type === 'dragenter' || e.type === 'dragover') {
-      setDragActive(true)
-    } else if (e.type === 'dragleave') {
-      setDragActive(false)
-    }
-  }, [])
-
-  const handleDrop = useCallback((e: React.DragEvent) => {
-    e.preventDefault()
-    e.stopPropagation()
-    setDragActive(false)
-    if (e.dataTransfer.files?.[0]) {
-      validateAndSetFile(e.dataTransfer.files[0])
-    }
-  }, [validateAndSetFile])
-
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const selectedFile = e.target.files?.[0]
-    if (selectedFile) {
-      validateAndSetFile(selectedFile)
-    }
-  }
-
-  const handleVideoLoaded = () => {
-    if (videoRef.current) {
-      const dur = videoRef.current.duration
-      setDuration(dur)
-      setTrimEnd(dur)
-    }
-  }
-
-  const handleTimeUpdate = () => {
-    if (videoRef.current) {
-      setCurrentTime(videoRef.current.currentTime)
-    }
-  }
-
-  const togglePlayPause = () => {
-    if (videoRef.current) {
-      if (isPlaying) {
-        videoRef.current.pause()
-      } else {
-        videoRef.current.play()
-      }
-      setIsPlaying(!isPlaying)
-    }
-  }
-
-  const handleTimelineClick = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (videoRef.current && duration > 0) {
-      const rect = e.currentTarget.getBoundingClientRect()
-      const x = e.clientX - rect.left
-      const percentage = x / rect.width
-      const newTime = percentage * duration
-      videoRef.current.currentTime = newTime
-      setCurrentTime(newTime)
-    }
-  }
-
-  const setTrimStartToCurrent = () => setTrimStart(currentTime)
-  const setTrimEndToCurrent = () => setTrimEnd(currentTime)
-
-  // AI command processing
-  const processAiCommand = (prompt: string) => {
-    const newEffects = { ...aiEffects }
-    let responses: string[] = []
-
-    for (const cmd of AI_COMMANDS) {
-      if (cmd.pattern.test(prompt)) {
-        switch (cmd.effect) {
-          case 'brightness':
-            newEffects.brightness = (newEffects.brightness || 0) + (cmd.value as number)
-            responses.push(`明るさを${(cmd.value as number) > 0 ? '上げ' : '下げ'}ました`)
-            break
-          case 'contrast':
-            newEffects.contrast = (newEffects.contrast || 1) + (cmd.value as number)
-            responses.push(`コントラストを調整しました`)
-            break
-          case 'saturation':
-            newEffects.saturation = (newEffects.saturation || 1) + (cmd.value as number)
-            responses.push(`彩度を調整しました`)
-            break
-          case 'speed':
-            newEffects.speed = cmd.value as number
-            responses.push(`再生速度を${cmd.value}倍に設定しました`)
-            break
-          case 'mute':
-            newEffects.mute = true
-            responses.push(`音声をミュートしました`)
-            break
-          case 'flip':
-            newEffects.flip = !newEffects.flip
-            responses.push(`映像を反転しました`)
-            break
-          case 'rotate':
-            newEffects.rotate = ((newEffects.rotate || 0) + (cmd.value as number)) % 360
-            responses.push(`映像を${cmd.value}度回転しました`)
-            break
-        }
-      }
-    }
-
-    if (responses.length === 0) {
-      responses.push('すみません、そのコマンドは認識できませんでした。\n\n使用可能なコマンド:\n• 明るく/暗く\n• コントラスト上げて\n• 彩度上げて/モノクロ\n• 2倍速/スロー\n• ミュート\n• 反転/回転')
-    }
-
-    setAiEffects(newEffects)
-    return responses.join('\n')
-  }
-
-  const handleAiSubmit = () => {
-    if (!aiPrompt.trim()) return
-
-    setAiMessages(prev => [...prev, { role: 'user', text: aiPrompt }])
-    const response = processAiCommand(aiPrompt)
-    setAiMessages(prev => [...prev, { role: 'ai', text: response }])
-    setAiPrompt('')
-  }
-
-  const handleSubmit = async () => {
-    if (!file) return
-
-    setIsProcessing(true)
-    setError(null)
-    setOutputUrl(null)
-    setProgress({ progress: 0, message: '準備中...' })
 
     try {
-      const outputBlob = await processVideo(
+      const duration = await getVideoDuration(file)
+      const url = URL.createObjectURL(file)
+      const videoId = generateId()
+      const clipId = generateId()
+
+      const newVideo: VideoSource = {
+        id: videoId,
         file,
-        format,
-        (p) => setProgress(p),
-        trimStart,
-        trimEnd,
-        aiEffects
-      )
+        url,
+        name: file.name,
+        duration
+      }
 
-      const url = URL.createObjectURL(outputBlob)
-      setOutputUrl(url)
-      setProgress({ progress: 100, message: '完了!' })
+      // Auto-create clip for the full video
+      const newClip: Clip = {
+        id: clipId,
+        sourceId: videoId,
+        startTime: 0,
+        endTime: duration
+      }
+
+      // Auto-add to timeline
+      const newTimelineItem: TimelineItem = {
+        clipId,
+        transition: 'none'
+      }
+
+      setProject(prev => ({
+        ...prev,
+        videos: [...prev.videos, newVideo],
+        clips: [...prev.clips, newClip],
+        timeline: [...prev.timeline, newTimelineItem]
+      }))
+
+      const videoIndex = project.videos.length + 1
+
+      // Notify user - video is automatically on timeline
+      setAiMessages(prev => [
+        ...prev,
+        { role: 'ai', text: `動画${videoIndex}「${file.name}」を追加しました（${duration.toFixed(1)}秒）\n\nタイムラインに自動追加済みです。編集指示をどうぞ！` }
+      ])
     } catch (err) {
-      console.error('Processing error:', err)
-      setError(err instanceof Error ? err.message : '処理中にエラーが発生しました')
-      setProgress(null)
-    } finally {
-      setIsProcessing(false)
+      setError('動画の読み込みに失敗しました')
+      console.error(err)
     }
+  }, [project.videos.length])
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files
+    if (files) {
+      Array.from(files).forEach(file => addVideoToProject(file))
+    }
+    e.target.value = '' // Reset input
   }
 
-  const handleReset = () => {
-    if (outputUrl) URL.revokeObjectURL(outputUrl)
-    if (previewUrl) URL.revokeObjectURL(previewUrl)
-    setFile(null)
-    setFileError(null)
-    setProgress(null)
-    setOutputUrl(null)
-    setError(null)
-    setIsProcessing(false)
-    setPreviewUrl(null)
-    setCurrentTime(0)
-    setDuration(0)
-    setTrimStart(0)
-    setTrimEnd(0)
-    setIsPlaying(false)
-    setAiEffects({})
-    setAiMessages([])
+  const handleAddClick = () => {
+    fileInputRef.current?.click()
   }
 
-  const handleDownload = () => {
-    if (!outputUrl) return
+  const handleDownload = (url: string) => {
     const a = document.createElement('a')
-    a.href = outputUrl
+    a.href = url
     a.download = `edited_${format}_${Date.now()}.mp4`
     document.body.appendChild(a)
     a.click()
     document.body.removeChild(a)
   }
 
-  const clearEffect = (effect: keyof VideoEffects) => {
-    setAiEffects(prev => {
-      const newEffects = { ...prev }
-      delete newEffects[effect]
-      return newEffects
+  // Process AI response and update project
+  const processAIResponse = useCallback((response: {
+    message: string
+    effects?: Partial<VideoEffects>
+    projectAction?: {
+      type: 'addClip' | 'removeClip' | 'reorderTimeline' | 'clearTimeline' | 'setGlobalEffects' | 'trimClip' | 'splitClip' | 'replaceTimeline' | 'setSubtitleStyle'
+      videoIndex?: number
+      startTime?: number
+      endTime?: number
+      clipIndex?: number
+      newOrder?: number[]
+      effects?: Partial<VideoEffects>
+      transition?: 'none' | 'fade' | 'crossfade'
+      newStartTime?: number
+      newEndTime?: number | null
+      splitAt?: number
+      clips?: Array<{
+        videoIndex: number
+        startTime: number
+        endTime: number
+        transition?: 'none' | 'fade' | 'crossfade'
+      }>
+      subtitleStyle?: {
+        fontSize?: 'small' | 'medium' | 'large'
+        position?: 'top' | 'center' | 'bottom'
+        color?: string
+        backgroundColor?: string
+      }
+    }
+    understood: boolean
+  }) => {
+    if (!response.understood) return
+
+    const action = response.projectAction
+
+    if (action) {
+      setProject(prev => {
+        const newProject = { ...prev }
+
+        switch (action.type) {
+          case 'addClip': {
+            if (action.videoIndex !== undefined && action.videoIndex > 0 && action.videoIndex <= prev.videos.length) {
+              const video = prev.videos[action.videoIndex - 1]
+              const clipId = generateId()
+
+              const newClip: Clip = {
+                id: clipId,
+                sourceId: video.id,
+                startTime: action.startTime ?? 0,
+                endTime: action.endTime ?? (video.duration || 10),
+                effects: action.effects
+              }
+
+              const newTimelineItem: TimelineItem = {
+                clipId,
+                transition: action.transition || 'none',
+                transitionDuration: action.transition === 'fade' ? 0.5 : undefined
+              }
+
+              newProject.clips = [...prev.clips, newClip]
+              newProject.timeline = [...prev.timeline, newTimelineItem]
+            }
+            break
+          }
+
+          case 'removeClip': {
+            if (action.clipIndex !== undefined && action.clipIndex >= 0) {
+              const clipToRemove = prev.timeline[action.clipIndex]
+              if (clipToRemove) {
+                newProject.timeline = prev.timeline.filter((_, i) => i !== action.clipIndex)
+                newProject.clips = prev.clips.filter(c => c.id !== clipToRemove.clipId)
+              }
+            }
+            break
+          }
+
+          case 'reorderTimeline': {
+            if (action.newOrder) {
+              newProject.timeline = action.newOrder
+                .filter(i => i >= 0 && i < prev.timeline.length)
+                .map(i => prev.timeline[i])
+            }
+            break
+          }
+
+          case 'clearTimeline': {
+            newProject.timeline = []
+            newProject.clips = []
+            break
+          }
+
+          case 'setGlobalEffects': {
+            if (action.effects) {
+              newProject.globalEffects = { ...prev.globalEffects, ...action.effects }
+            }
+            break
+          }
+
+          case 'trimClip': {
+            if (action.clipIndex !== undefined && action.clipIndex >= 0 && action.clipIndex < prev.timeline.length) {
+              const timelineItem = prev.timeline[action.clipIndex]
+              const clipToTrim = prev.clips.find(c => c.id === timelineItem.clipId)
+              if (clipToTrim) {
+                const updatedClip = { ...clipToTrim }
+                if (action.newStartTime !== undefined) {
+                  updatedClip.startTime = action.newStartTime
+                }
+                if (action.newEndTime !== undefined && action.newEndTime !== null) {
+                  updatedClip.endTime = action.newEndTime
+                }
+                newProject.clips = prev.clips.map(c => c.id === clipToTrim.id ? updatedClip : c)
+              }
+            }
+            break
+          }
+
+          case 'replaceTimeline': {
+            // Auto-edit: Replace entire timeline with AI-suggested clips
+            if (action.clips && Array.isArray(action.clips)) {
+              const newClips: Clip[] = []
+              const newTimeline: TimelineItem[] = []
+
+              for (const clipDef of action.clips) {
+                if (clipDef.videoIndex > 0 && clipDef.videoIndex <= prev.videos.length) {
+                  const video = prev.videos[clipDef.videoIndex - 1]
+                  const clipId = generateId()
+
+                  newClips.push({
+                    id: clipId,
+                    sourceId: video.id,
+                    startTime: clipDef.startTime,
+                    endTime: Math.min(clipDef.endTime, video.duration || clipDef.endTime)
+                  })
+
+                  newTimeline.push({
+                    clipId,
+                    transition: clipDef.transition || 'none',
+                    transitionDuration: clipDef.transition === 'fade' ? 0.5 : undefined
+                  })
+                }
+              }
+
+              newProject.clips = newClips
+              newProject.timeline = newTimeline
+            }
+            break
+          }
+
+        }
+
+        return newProject
+      })
+    }
+
+    // Handle subtitle style changes
+    if (action && action.type === 'setSubtitleStyle' && action.subtitleStyle) {
+      setSubtitleStyle(prev => ({
+        ...prev,
+        ...action.subtitleStyle
+      }))
+    }
+
+    // Handle global effects from response.effects
+    if (response.effects && Object.keys(response.effects).length > 0) {
+      setProject(prev => ({
+        ...prev,
+        globalEffects: { ...prev.globalEffects, ...response.effects }
+      }))
+    }
+  }, [])
+
+  // AI command processing
+  const handleAiSubmit = async () => {
+    if (!aiPrompt.trim() || aiLoading) return
+
+    const userMessage = aiPrompt.trim()
+    setAiMessages(prev => [...prev, { role: 'user', text: userMessage }])
+    setAiPrompt('')
+    setAiLoading(true)
+
+    // Check if user wants to export
+    if (userMessage.match(/出力|エクスポート|書き出|保存|ダウンロード|完成/i)) {
+      if (project.timeline.length === 0 && project.videos.length > 0) {
+        // Auto-add all videos to timeline if not done yet
+        setAiMessages(prev => [...prev, {
+          role: 'ai',
+          text: 'タイムラインにクリップがありません。まず「動画1を全部使って」などで動画をタイムラインに追加してください。'
+        }])
+        setAiLoading(false)
+        return
+      }
+      await handleExport()
+      setAiLoading(false)
+      return
+    }
+
+    // Check if no video
+    if (project.videos.length === 0 && !userMessage.match(/こんにちは|ヘルプ|help|使い方/i)) {
+      setAiMessages(prev => [...prev, {
+        role: 'ai',
+        text: 'まず動画を追加してください。左下の＋ボタンから動画を選択できます。'
+      }])
+      setAiLoading(false)
+      return
+    }
+
+    // Check if user wants subtitles
+    if (userMessage.match(/字幕|テロップ|文字起こし|キャプション|subtitle/i)) {
+      if (project.videos.length === 0) {
+        setAiMessages(prev => [...prev, {
+          role: 'ai',
+          text: 'まず動画を追加してください。'
+        }])
+        setAiLoading(false)
+        return
+      }
+
+      // Handle subtitle style changes
+      if (userMessage.match(/大き|サイズ/i)) {
+        if (userMessage.match(/大き/i)) {
+          setSubtitleStyle(prev => ({ ...prev, fontSize: 'large' }))
+          setAiMessages(prev => [...prev, { role: 'ai', text: '字幕を大きくしました。' }])
+        } else if (userMessage.match(/小さ/i)) {
+          setSubtitleStyle(prev => ({ ...prev, fontSize: 'small' }))
+          setAiMessages(prev => [...prev, { role: 'ai', text: '字幕を小さくしました。' }])
+        }
+        setAiLoading(false)
+        return
+      }
+
+      if (userMessage.match(/消|削除|非表示|オフ/i)) {
+        setSubtitles([])
+        setAiMessages(prev => [...prev, { role: 'ai', text: '字幕を削除しました。' }])
+        setAiLoading(false)
+        return
+      }
+
+      // Generate subtitles
+      if (subtitles.length > 0 && !userMessage.match(/再生成|やり直|もう一度/i)) {
+        setAiMessages(prev => [...prev, {
+          role: 'ai',
+          text: `字幕は既に生成済みです（${subtitles.length}個のセグメント）。\n再生成する場合は「字幕を再生成して」と言ってください。`
+        }])
+        setAiLoading(false)
+        return
+      }
+
+      await handleGenerateSubtitles()
+      setAiLoading(false)
+      return
+    }
+
+    try {
+      // Add user message to conversation history
+      const updatedHistory: ConversationMessage[] = [
+        ...conversationHistory,
+        { role: 'user', content: userMessage }
+      ]
+
+      // Check if user is requesting auto-edit/scene analysis
+      const isAutoEditRequest = userMessage.match(/カット|切っ|お任せ|自動|いい感じに|良い感じに|ハイライト|見どころ|短く|要約|まとめ/i)
+
+      // Extract frames from first video for AI vision
+      let frames: string[] | undefined
+      let frameTimestampInfo = ''
+
+      if (project.videos.length > 0 && project.videos[0].url) {
+        try {
+          if (isAutoEditRequest) {
+            // Use detailed scene analysis for auto-edit requests
+            const sceneData = await extractFramesForSceneAnalysis(project.videos[0].url, 2)
+            frames = sceneData.frames.map(f => f.base64)
+            frameTimestampInfo = `\n\n【フレームのタイムスタンプ情報】\n${sceneData.frames.map((f, i) => `フレーム${i + 1}: ${f.timestamp.toFixed(1)}秒`).join('\n')}\n動画の長さ: ${sceneData.duration.toFixed(1)}秒\n\nこれらのフレームを分析して、良い部分と不要な部分を判断してください。`
+          } else {
+            // Use standard frame extraction for other requests
+            frames = await extractVideoFrames(project.videos[0].url, 3)
+          }
+        } catch (frameErr) {
+          console.warn('Could not extract frames:', frameErr)
+        }
+      }
+
+      // Build context for AI
+      const projectContext = {
+        videoCount: project.videos.length,
+        videos: project.videos.map((v, i) => ({
+          index: i + 1,
+          name: v.name,
+          duration: v.duration?.toFixed(1) || 'unknown'
+        })),
+        timelineClipCount: project.timeline.length,
+        timeline: project.timeline.map((t, i) => {
+          const clip = project.clips.find(c => c.id === t.clipId)
+          const video = clip ? project.videos.find(v => v.id === clip.sourceId) : null
+          const videoIndex = video ? project.videos.indexOf(video) + 1 : 0
+          return {
+            position: i + 1,
+            videoIndex,
+            startTime: clip?.startTime,
+            endTime: clip?.endTime,
+            transition: t.transition
+          }
+        }),
+        globalEffects: project.globalEffects
+      }
+
+      // Append frame timestamp info for auto-edit requests
+      const promptWithContext = frameTimestampInfo
+        ? userMessage + frameTimestampInfo
+        : userMessage
+
+      const response = await callAI(promptWithContext, DEFAULT_API_KEY, frames, projectContext, updatedHistory)
+
+      processAIResponse(response)
+
+      // Add AI response to conversation history
+      setConversationHistory([
+        ...updatedHistory,
+        { role: 'assistant', content: response.message }
+      ])
+
+      // Handle format from message
+      if (userMessage.match(/tiktok|ティックトック/i)) setFormat('tiktok')
+      else if (userMessage.match(/youtube|ユーチューブ/i)) setFormat('youtube')
+      else if (userMessage.match(/正方形|スクエア|square|インスタ/i)) setFormat('square')
+
+      setAiMessages(prev => [...prev, { role: 'ai', text: response.message }])
+    } catch (err) {
+      console.error('AI processing error:', err)
+      setAiMessages(prev => [...prev, {
+        role: 'ai',
+        text: 'エラーが発生しました。もう一度お試しください。'
+      }])
+    } finally {
+      setAiLoading(false)
+    }
+  }
+
+  const handleExport = async () => {
+    if (project.timeline.length === 0) {
+      setAiMessages(prev => [...prev, {
+        role: 'ai',
+        text: 'タイムラインにクリップがありません。'
+      }])
+      return
+    }
+
+    setIsProcessing(true)
+    setError(null)
+    setProgress({ progress: 0, message: '準備中...' })
+
+    setAiMessages(prev => [...prev, { role: 'ai', text: '動画を処理しています...' }])
+
+    try {
+      // Include subtitles in the project for export
+      const projectWithSubtitles = {
+        ...project,
+        subtitles: subtitles.length > 0 ? {
+          segments: subtitles.map(s => ({
+            startTime: s.startTime,
+            endTime: s.endTime,
+            text: s.text
+          })),
+          style: subtitleStyle
+        } : undefined
+      }
+      const outputBlob = await processProject(projectWithSubtitles, format, (p) => setProgress(p))
+      const url = URL.createObjectURL(outputBlob)
+      setProgress(null)
+
+      setAiMessages(prev => [...prev, {
+        role: 'ai',
+        text: '完成しました！',
+        video: { url, name: 'output.mp4', isOutput: true }
+      }])
+    } catch (err) {
+      console.error('Processing error:', err)
+      setError(err instanceof Error ? err.message : '処理中にエラーが発生しました')
+      setAiMessages(prev => [...prev, {
+        role: 'ai',
+        text: 'エラーが発生しました: ' + (err instanceof Error ? err.message : '不明なエラー')
+      }])
+      setProgress(null)
+    } finally {
+      setIsProcessing(false)
+    }
+  }
+
+  // Generate subtitles using Whisper
+  const handleGenerateSubtitles = async () => {
+    if (project.videos.length === 0) return
+
+    setIsGeneratingSubtitles(true)
+    setSubtitleProgress({ progress: 0, message: '字幕生成を開始...' })
+    setAiMessages(prev => [...prev, { role: 'ai', text: '字幕を生成しています...\n（初回はモデルのダウンロードに時間がかかります）' }])
+
+    try {
+      const videoUrl = project.videos[0].url
+      const segments = await generateSubtitles(
+        videoUrl,
+        'ja',
+        (progress, message) => {
+          setSubtitleProgress({ progress, message })
+        }
+      )
+
+      setSubtitles(segments)
+      setSubtitleProgress(null)
+
+      if (segments.length > 0) {
+        const previewText = segments.slice(0, 3).map(s =>
+          `${Math.floor(s.startTime)}秒: 「${s.text}」`
+        ).join('\n')
+
+        setAiMessages(prev => [...prev, {
+          role: 'ai',
+          text: `字幕を生成しました！（${segments.length}個のセグメント）\n\n${previewText}${segments.length > 3 ? '\n...' : ''}\n\nプレビューに字幕が表示されます。`
+        }])
+      } else {
+        setAiMessages(prev => [...prev, {
+          role: 'ai',
+          text: '音声が検出できませんでした。動画に音声が含まれているか確認してください。'
+        }])
+      }
+    } catch (err) {
+      console.error('Subtitle generation error:', err)
+      setSubtitleProgress(null)
+      setAiMessages(prev => [...prev, {
+        role: 'ai',
+        text: '字幕の生成に失敗しました: ' + (err instanceof Error ? err.message : '不明なエラー')
+      }])
+    } finally {
+      setIsGeneratingSubtitles(false)
+    }
+  }
+
+  // Get timeline summary for display
+  const getTimelineSummary = () => {
+    if (project.timeline.length === 0) return null
+
+    return project.timeline.map((t, i) => {
+      const clip = project.clips.find(c => c.id === t.clipId)
+      const video = clip ? project.videos.find(v => v.id === clip.sourceId) : null
+      const videoIndex = video ? project.videos.indexOf(video) + 1 : 0
+      return {
+        position: i + 1,
+        videoIndex,
+        startTime: clip?.startTime || 0,
+        endTime: clip?.endTime || 0,
+        transition: t.transition
+      }
     })
   }
 
   if (!isSupported) {
     return (
-      <div className="min-h-screen bg-[#1a1a1a] flex items-center justify-center p-4">
-        <div className="bg-[#2a2a2a] rounded-lg p-8 text-center max-w-md">
-          <AlertTriangle className="h-16 w-16 mx-auto text-yellow-500 mb-4" />
-          <h2 className="text-xl font-bold mb-2 text-white">ブラウザがサポートされていません</h2>
-          <p className="text-gray-400">Chrome、Firefox、またはEdgeの最新版をお使いください。</p>
+      <div className="h-[100dvh] bg-[#212121] flex items-center justify-center p-4">
+        <div className="bg-[#2a2a2a] rounded-lg p-6 sm:p-8 text-center max-w-sm sm:max-w-md">
+          <AlertTriangle className="h-12 w-12 sm:h-16 sm:w-16 mx-auto text-yellow-500 mb-3 sm:mb-4" />
+          <h2 className="text-lg sm:text-xl font-bold mb-2 text-white">ブラウザがサポートされていません</h2>
+          <p className="text-sm sm:text-base text-gray-400">Chrome、Firefox、またはEdgeの最新版をお使いください。</p>
         </div>
       </div>
     )
   }
 
+  const timelineSummary = getTimelineSummary()
+  const previewState = getCurrentPreviewState()
+  const currentSubtitle = getCurrentSubtitle(subtitles, currentTime)
+
+  // Get subtitle font size in pixels
+  const getSubtitleFontSize = () => {
+    switch (subtitleStyle.fontSize) {
+      case 'small': return 'text-sm'
+      case 'large': return 'text-xl'
+      default: return 'text-base'
+    }
+  }
+
   return (
-    <div className="min-h-screen bg-[#1a1a1a] text-white flex flex-col">
-      {/* Header */}
-      <header className="bg-[#0d0d0d] border-b border-[#333] px-3 md:px-4 py-2 flex items-center justify-between">
-        <div className="flex items-center gap-2 md:gap-4">
-          <Sparkles className="h-5 w-5 text-blue-400" />
-          <h1 className="text-base md:text-lg font-semibold">AI Video Editor</h1>
-          {file && <span className="hidden md:inline text-sm text-gray-400 truncate max-w-[200px]">{file.name}</span>}
-        </div>
-        <div className="flex items-center gap-2">
-          {file && (
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={handleReset}
-              className="text-gray-400 hover:text-white hover:bg-[#333]"
-            >
-              <RotateCcw className="h-4 w-4 md:mr-1" />
-              <span className="hidden md:inline">リセット</span>
-            </Button>
-          )}
-          {/* Mobile menu toggle */}
-          <Button
-            variant="ghost"
-            size="sm"
-            className="md:hidden text-gray-400"
-            onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
-          >
-            {mobileMenuOpen ? <X className="h-5 w-5" /> : <Menu className="h-5 w-5" />}
-          </Button>
-        </div>
-      </header>
-
-      <div className="flex-1 flex flex-col md:flex-row overflow-hidden">
-        {/* Left Panel - Media Pool (hidden on mobile unless toggled) */}
-        <div className={`${mobileMenuOpen && activePanel === 'media' ? 'block' : 'hidden'} md:block w-full md:w-56 lg:w-64 bg-[#1f1f1f] border-r border-[#333] p-3 overflow-y-auto`}>
-          <h2 className="text-xs font-semibold text-gray-400 uppercase mb-3">メディア</h2>
-
-          {!file ? (
-            <div
-              className={`border-2 border-dashed rounded-lg p-4 md:p-6 text-center transition-colors cursor-pointer
-                ${dragActive ? 'border-blue-500 bg-blue-500/10' : 'border-[#444] hover:border-[#555]'}
-                ${fileError ? 'border-red-500 bg-red-500/10' : ''}`}
-              onDragEnter={handleDrag}
-              onDragLeave={handleDrag}
-              onDragOver={handleDrag}
-              onDrop={handleDrop}
-            >
-              <input
-                type="file"
-                accept="video/*"
-                onChange={handleFileChange}
-                className="hidden"
-                id="video-upload"
-                disabled={isProcessing}
-              />
-              <label htmlFor="video-upload" className="cursor-pointer">
-                <Upload className="h-8 w-8 mx-auto text-gray-500 mb-2" />
-                <p className="text-sm text-gray-400">動画をドロップ</p>
-                <p className="text-xs text-gray-500 mt-1">最大{MAX_FILE_SIZE_MB}MB</p>
-              </label>
-            </div>
-          ) : (
-            <div className="bg-[#2a2a2a] rounded p-2">
-              <div className="aspect-video bg-black rounded overflow-hidden mb-2">
-                {previewUrl && <video src={previewUrl} className="w-full h-full object-contain" />}
-              </div>
-              <p className="text-xs text-gray-400 truncate">{file.name}</p>
-              <p className="text-xs text-gray-500">{(file.size / 1024 / 1024).toFixed(1)} MB</p>
-            </div>
-          )}
-
-          {fileError && (
-            <p className="text-xs text-red-400 mt-2 flex items-center gap-1">
-              <XCircle className="h-3 w-3" />
-              {fileError}
-            </p>
-          )}
-
-          {/* Applied Effects */}
-          {Object.keys(aiEffects).length > 0 && (
-            <div className="mt-4">
-              <h3 className="text-xs text-gray-400 mb-2">適用中のエフェクト</h3>
-              <div className="space-y-1">
-                {aiEffects.brightness !== undefined && (
-                  <div className="flex items-center justify-between bg-[#2a2a2a] rounded px-2 py-1">
-                    <span className="text-xs flex items-center gap-1"><Sun className="h-3 w-3" /> 明るさ {aiEffects.brightness > 0 ? '+' : ''}{(aiEffects.brightness * 100).toFixed(0)}%</span>
-                    <button onClick={() => clearEffect('brightness')} className="text-gray-500 hover:text-white"><X className="h-3 w-3" /></button>
-                  </div>
-                )}
-                {aiEffects.speed !== undefined && (
-                  <div className="flex items-center justify-between bg-[#2a2a2a] rounded px-2 py-1">
-                    <span className="text-xs flex items-center gap-1"><Gauge className="h-3 w-3" /> 速度 {aiEffects.speed}x</span>
-                    <button onClick={() => clearEffect('speed')} className="text-gray-500 hover:text-white"><X className="h-3 w-3" /></button>
-                  </div>
-                )}
-                {aiEffects.mute && (
-                  <div className="flex items-center justify-between bg-[#2a2a2a] rounded px-2 py-1">
-                    <span className="text-xs flex items-center gap-1"><VolumeX className="h-3 w-3" /> ミュート</span>
-                    <button onClick={() => clearEffect('mute')} className="text-gray-500 hover:text-white"><X className="h-3 w-3" /></button>
-                  </div>
-                )}
-              </div>
-            </div>
-          )}
-        </div>
-
-        {/* Center - Preview + AI Chat */}
-        <div className="flex-1 bg-[#0d0d0d] flex flex-col min-h-0">
+    <div className="h-[100dvh] bg-[#212121] text-white flex flex-col overflow-hidden overscroll-none">
+      {/* Fixed Preview Panel */}
+      <div className="flex-shrink-0 bg-[#1a1a1a] border-b border-[#333] touch-none">
+        <div className="max-w-2xl md:max-w-3xl lg:max-w-4xl mx-auto p-2 sm:p-3">
           {/* Video Preview */}
-          <div className="flex-1 flex items-center justify-center p-2 md:p-4 min-h-[200px]">
-            {previewUrl ? (
-              <video
-                ref={videoRef}
-                src={previewUrl}
-                className="max-w-full max-h-full rounded"
-                onLoadedMetadata={handleVideoLoaded}
-                onTimeUpdate={handleTimeUpdate}
-                onPlay={() => setIsPlaying(true)}
-                onPause={() => setIsPlaying(false)}
-                onEnded={() => setIsPlaying(false)}
-              />
-            ) : outputUrl ? (
-              <video src={outputUrl} controls className="max-w-full max-h-full rounded" />
+          <div className="relative bg-black rounded-lg overflow-hidden mb-2">
+            {project.videos.length === 0 ? (
+              <div className="aspect-video flex items-center justify-center text-gray-500">
+                <div className="text-center p-4">
+                  <Film className="h-12 w-12 mx-auto mb-2 opacity-50" />
+                  <p className="text-sm">動画を追加してください</p>
+                </div>
+              </div>
+            ) : project.timeline.length === 0 ? (
+              <div className="aspect-video flex items-center justify-center relative">
+                <video
+                  src={project.videos[0].url}
+                  className="max-h-[30vh] sm:max-h-[35vh] w-auto mx-auto"
+                  style={{
+                    filter: effectsToCssFilter(project.globalEffects),
+                    transform: effectsToCssTransform(project.globalEffects),
+                  }}
+                  muted={isMuted || project.globalEffects.mute}
+                  preload="metadata"
+                  playsInline
+                  autoPlay={false}
+                  onLoadedMetadata={(e) => {
+                    // Show first frame
+                    const video = e.currentTarget
+                    video.currentTime = 0.1
+                  }}
+                />
+                <div className="absolute bottom-2 left-2 text-xs text-gray-400 bg-black/50 px-2 py-1 rounded">
+                  タイムラインに追加してください
+                </div>
+              </div>
             ) : (
-              <div className="text-gray-500 text-center p-4">
-                <Upload className="h-12 w-12 mx-auto mb-4 opacity-50" />
-                <p className="text-sm">動画をアップロードしてください</p>
+              <div className="aspect-video flex items-center justify-center relative">
+                <video
+                  ref={previewVideoRef}
+                  src={previewState?.video?.url || project.videos[0].url}
+                  className="max-h-[30vh] sm:max-h-[35vh] w-auto mx-auto"
+                  style={{
+                    filter: effectsToCssFilter(project.globalEffects),
+                    transform: effectsToCssTransform(project.globalEffects),
+                  }}
+                  muted={isMuted || project.globalEffects.mute}
+                  preload="metadata"
+                  playsInline
+                  onLoadedMetadata={(e) => {
+                    // Show first frame
+                    const video = e.currentTarget
+                    if (!isPlaying) {
+                      video.currentTime = 0.1
+                    }
+                  }}
+                />
+                {/* Vignette overlay */}
+                {project.globalEffects.vignette && project.globalEffects.vignette > 0 && (
+                  <div
+                    className="absolute inset-0 pointer-events-none"
+                    style={{
+                      boxShadow: `inset 0 0 ${50 + project.globalEffects.vignette * 100}px ${20 + project.globalEffects.vignette * 40}px rgba(0,0,0,${0.3 + project.globalEffects.vignette * 0.5})`,
+                    }}
+                  />
+                )}
+                {/* Subtitle overlay */}
+                {currentSubtitle && (
+                  <div
+                    className={`absolute left-0 right-0 flex justify-center pointer-events-none px-4 ${
+                      subtitleStyle.position === 'top' ? 'top-4' :
+                      subtitleStyle.position === 'center' ? 'top-1/2 -translate-y-1/2' :
+                      'bottom-8'
+                    }`}
+                  >
+                    <span
+                      className={`${getSubtitleFontSize()} px-3 py-1.5 rounded font-medium text-center max-w-[90%]`}
+                      style={{
+                        color: subtitleStyle.color,
+                        backgroundColor: subtitleStyle.backgroundColor,
+                      }}
+                    >
+                      {currentSubtitle.text}
+                    </span>
+                  </div>
+                )}
+                {/* Current clip indicator */}
+                <div className="absolute top-2 left-2 text-xs bg-black/70 px-2 py-1 rounded">
+                  クリップ {activeClipIndex + 1}/{project.timeline.length}
+                </div>
+                {/* Subtitle indicator */}
+                {subtitles.length > 0 && (
+                  <div className="absolute top-2 right-2 text-xs bg-blue-600/70 px-2 py-1 rounded">
+                    字幕ON
+                  </div>
+                )}
               </div>
             )}
           </div>
 
           {/* Playback Controls */}
-          {previewUrl && (
-            <div className="bg-[#1a1a1a] border-t border-[#333] p-2 md:p-3">
-              <div className="flex items-center justify-center gap-4">
-                <Button variant="ghost" size="sm" onClick={togglePlayPause} className="text-white hover:bg-[#333]">
-                  {isPlaying ? <Pause className="h-5 w-5" /> : <Play className="h-5 w-5" />}
-                </Button>
-                <span className="text-xs md:text-sm font-mono text-gray-400">
-                  {formatTime(currentTime)} / {formatTime(duration)}
-                </span>
+          {project.timeline.length > 0 && (
+            <div className="space-y-2">
+              {/* Timeline Bar */}
+              <div className="relative">
+                <input
+                  type="range"
+                  min="0"
+                  max={totalDuration || 1}
+                  step="0.1"
+                  value={currentTime}
+                  onChange={handleSeek}
+                  className="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-blue-500"
+                />
+                {/* Clip markers on timeline */}
+                <div className="absolute top-0 left-0 right-0 h-2 pointer-events-none flex">
+                  {(() => {
+                    let accumulated = 0
+                    return project.timeline.map((item, i) => {
+                      const clip = project.clips.find(c => c.id === item.clipId)
+                      if (!clip) return null
+                      const clipDuration = (clip.endTime - clip.startTime) / (project.globalEffects.speed || 1)
+                      const widthPercent = (clipDuration / totalDuration) * 100
+                      const leftPercent = (accumulated / totalDuration) * 100
+                      accumulated += clipDuration
+                      const colors = ['bg-blue-500/30', 'bg-green-500/30', 'bg-purple-500/30', 'bg-orange-500/30']
+                      return (
+                        <div
+                          key={i}
+                          className={`absolute h-full ${colors[i % colors.length]} ${i === activeClipIndex ? 'ring-1 ring-white' : ''}`}
+                          style={{ left: `${leftPercent}%`, width: `${widthPercent}%` }}
+                        />
+                      )
+                    })
+                  })()}
+                </div>
               </div>
-            </div>
-          )}
 
-          {/* AI Chat Interface */}
-          <div className="h-48 md:h-56 bg-[#1f1f1f] border-t border-[#333] flex flex-col">
-            <div className="px-3 py-2 border-b border-[#333] flex items-center gap-2">
-              <Sparkles className="h-4 w-4 text-blue-400" />
-              <span className="text-xs font-semibold text-gray-300">AI編集アシスタント</span>
-            </div>
+              {/* Controls */}
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={handleRestart}
+                    className="p-1.5 hover:bg-white/10 rounded-full transition-colors"
+                  >
+                    <SkipBack className="h-4 w-4" />
+                  </button>
+                  <button
+                    onClick={handlePlayPause}
+                    className="p-2 bg-white text-black rounded-full hover:bg-gray-200 transition-colors"
+                  >
+                    {isPlaying ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4 ml-0.5" />}
+                  </button>
+                  <button
+                    onClick={() => setIsMuted(!isMuted)}
+                    className="p-1.5 hover:bg-white/10 rounded-full transition-colors"
+                  >
+                    {isMuted ? <VolumeX className="h-4 w-4" /> : <Volume2 className="h-4 w-4" />}
+                  </button>
+                </div>
+                <div className="text-xs text-gray-400">
+                  {formatTime(currentTime)} / {formatTime(totalDuration)}
+                </div>
+                <div className="flex items-center gap-1">
+                  {project.globalEffects.speed && project.globalEffects.speed !== 1 && (
+                    <span className="text-xs px-1.5 py-0.5 rounded bg-blue-600/30 text-blue-300">
+                      {project.globalEffects.speed}x
+                    </span>
+                  )}
+                  {project.videos.length > 0 && (
+                    <span className="text-xs text-gray-500">
+                      {project.videos.length}本
+                    </span>
+                  )}
+                </div>
+              </div>
 
-            {/* Messages */}
-            <div className="flex-1 overflow-y-auto p-3 space-y-2">
-              {aiMessages.length === 0 && (
-                <div className="text-xs text-gray-500 text-center py-4">
-                  <p>AIに編集指示を出してください</p>
-                  <p className="mt-1 text-gray-600">例: 「明るくして」「2倍速にして」「ミュート」</p>
+              {/* Timeline Clips Summary */}
+              <div className="flex flex-wrap gap-1">
+                {timelineSummary?.map((item, i) => (
+                  <div key={i} className="flex items-center">
+                    <span className={`text-[10px] px-2 py-0.5 rounded transition-colors ${
+                      i === activeClipIndex
+                        ? 'bg-blue-600 text-white'
+                        : 'bg-blue-600/30 text-blue-300'
+                    }`}>
+                      動画{item.videoIndex} ({item.startTime.toFixed(1)}s-{item.endTime.toFixed(1)}s)
+                    </span>
+                    {i < (timelineSummary?.length || 0) - 1 && (
+                      <span className="text-gray-500 mx-1 text-[10px]">
+                        {item.transition === 'fade' ? '⟿' : '→'}
+                      </span>
+                    )}
+                  </div>
+                ))}
+              </div>
+
+              {/* Active Effects */}
+              {Object.keys(project.globalEffects).length > 0 && (
+                <div className="flex flex-wrap gap-1">
+                  {project.globalEffects.preset && project.globalEffects.preset !== 'none' && (
+                    <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-indigo-600/30 text-indigo-300">
+                      {getPresetName(project.globalEffects.preset)}
+                    </span>
+                  )}
+                  {project.globalEffects.brightness !== undefined && project.globalEffects.brightness !== 0 && (
+                    <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-yellow-600/30 text-yellow-300">
+                      明るさ {project.globalEffects.brightness > 0 ? '+' : ''}{Math.round(project.globalEffects.brightness * 100)}%
+                    </span>
+                  )}
+                  {project.globalEffects.contrast !== undefined && project.globalEffects.contrast !== 1 && (
+                    <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-orange-600/30 text-orange-300">
+                      コントラスト {Math.round(project.globalEffects.contrast * 100)}%
+                    </span>
+                  )}
+                  {project.globalEffects.saturation !== undefined && project.globalEffects.saturation !== 1 && (
+                    <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-pink-600/30 text-pink-300">
+                      彩度 {Math.round(project.globalEffects.saturation * 100)}%
+                    </span>
+                  )}
+                  {project.globalEffects.blur && project.globalEffects.blur > 0 && (
+                    <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-gray-600/30 text-gray-300">
+                      ぼかし {project.globalEffects.blur}px
+                    </span>
+                  )}
                 </div>
               )}
-              {aiMessages.map((msg, i) => (
-                <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                  <div className={`max-w-[80%] rounded-lg px-3 py-2 text-xs ${
-                    msg.role === 'user' ? 'bg-blue-600 text-white' : 'bg-[#2a2a2a] text-gray-300'
-                  }`}>
-                    <pre className="whitespace-pre-wrap font-sans">{msg.text}</pre>
-                  </div>
-                </div>
-              ))}
-              <div ref={chatEndRef} />
-            </div>
-
-            {/* Input */}
-            <div className="p-2 border-t border-[#333]">
-              <div className="flex gap-2">
-                <input
-                  type="text"
-                  value={aiPrompt}
-                  onChange={(e) => setAiPrompt(e.target.value)}
-                  onKeyDown={(e) => e.key === 'Enter' && handleAiSubmit()}
-                  placeholder="編集指示を入力..."
-                  className="flex-1 bg-[#2a2a2a] border border-[#444] rounded px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-blue-500"
-                />
-                <Button onClick={handleAiSubmit} size="sm" className="bg-blue-600 hover:bg-blue-700">
-                  <Send className="h-4 w-4" />
-                </Button>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        {/* Right Panel - Settings (hidden on mobile unless toggled) */}
-        <div className={`${mobileMenuOpen && activePanel === 'settings' ? 'block' : 'hidden'} md:block w-full md:w-56 lg:w-64 bg-[#1f1f1f] border-l border-[#333] p-3 overflow-y-auto`}>
-          <h2 className="text-xs font-semibold text-gray-400 uppercase mb-3">設定</h2>
-
-          {/* Format Selection */}
-          <div className="mb-4">
-            <label className="block text-xs text-gray-400 mb-2">出力フォーマット</label>
-            <div className="grid grid-cols-2 gap-1">
-              {formats.map((f) => (
-                <button
-                  key={f.value}
-                  onClick={() => setFormat(f.value)}
-                  disabled={isProcessing}
-                  className={`px-2 py-2 rounded text-xs font-medium transition-colors
-                    ${format === f.value ? 'bg-blue-600 text-white' : 'bg-[#2a2a2a] text-gray-300 hover:bg-[#333]'}`}
-                >
-                  {f.label}
-                  <span className="block text-[10px] opacity-70">{f.aspect}</span>
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {/* Trim Controls */}
-          {previewUrl && duration > 0 && (
-            <div className="mb-4">
-              <label className="block text-xs text-gray-400 mb-2">
-                <Scissors className="h-3 w-3 inline mr-1" />
-                トリミング
-              </label>
-              <div className="space-y-2">
-                <div className="flex items-center gap-1">
-                  <span className="text-xs text-gray-500 w-8">開始</span>
-                  <div className="flex-1 bg-[#2a2a2a] rounded px-2 py-1">
-                    <span className="text-xs font-mono">{formatTime(trimStart)}</span>
-                  </div>
-                  <Button variant="ghost" size="sm" onClick={setTrimStartToCurrent} className="text-[10px] text-blue-400 hover:bg-[#333] px-1 h-6">
-                    設定
-                  </Button>
-                </div>
-                <div className="flex items-center gap-1">
-                  <span className="text-xs text-gray-500 w-8">終了</span>
-                  <div className="flex-1 bg-[#2a2a2a] rounded px-2 py-1">
-                    <span className="text-xs font-mono">{formatTime(trimEnd)}</span>
-                  </div>
-                  <Button variant="ghost" size="sm" onClick={setTrimEndToCurrent} className="text-[10px] text-blue-400 hover:bg-[#333] px-1 h-6">
-                    設定
-                  </Button>
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* Progress */}
-          {progress && (
-            <div className="mb-4 p-2 rounded bg-[#2a2a2a]">
-              <div className="flex items-center justify-between mb-1">
-                <span className="text-xs text-gray-400">{progress.message}</span>
-                <span className="text-xs text-gray-500">{progress.progress}%</span>
-              </div>
-              <div className="w-full bg-[#1a1a1a] rounded-full h-1">
-                <div
-                  className={`h-1 rounded-full transition-all ${
-                    error ? 'bg-red-500' : progress.progress === 100 ? 'bg-green-500' : 'bg-blue-500'
-                  }`}
-                  style={{ width: `${progress.progress}%` }}
-                />
-              </div>
-            </div>
-          )}
-
-          {/* Error */}
-          {error && (
-            <div className="mb-4 p-2 bg-red-500/10 border border-red-500/30 rounded">
-              <p className="text-xs text-red-400 flex items-center gap-1">
-                <XCircle className="h-3 w-3" />
-                {error}
-              </p>
-            </div>
-          )}
-
-          {/* Export Button */}
-          <Button
-            onClick={handleSubmit}
-            disabled={!file || isProcessing}
-            className="w-full bg-blue-600 hover:bg-blue-700 text-white"
-          >
-            {isProcessing ? (
-              <><Loader2 className="h-4 w-4 mr-2 animate-spin" />処理中...</>
-            ) : (
-              <><Download className="h-4 w-4 mr-2" />エクスポート</>
-            )}
-          </Button>
-
-          {/* Download Button */}
-          {outputUrl && (
-            <div className="mt-3 p-2 bg-green-500/10 border border-green-500/30 rounded">
-              <p className="text-xs text-green-400 flex items-center gap-1 mb-2">
-                <CheckCircle className="h-3 w-3" />完了!
-              </p>
-              <Button onClick={handleDownload} className="w-full bg-green-600 hover:bg-green-700" size="sm">
-                <Download className="h-4 w-4 mr-2" />ダウンロード
-              </Button>
             </div>
           )}
         </div>
       </div>
 
-      {/* Mobile Panel Switcher */}
-      {mobileMenuOpen && (
-        <div className="md:hidden fixed bottom-0 left-0 right-0 bg-[#0d0d0d] border-t border-[#333] p-2 flex gap-2">
-          <Button
-            variant={activePanel === 'media' ? 'default' : 'ghost'}
-            size="sm"
-            className="flex-1"
-            onClick={() => setActivePanel('media')}
-          >
-            メディア
-          </Button>
-          <Button
-            variant={activePanel === 'settings' ? 'default' : 'ghost'}
-            size="sm"
-            className="flex-1"
-            onClick={() => setActivePanel('settings')}
-          >
-            設定
-          </Button>
-        </div>
-      )}
-
-      {/* Timeline */}
-      {previewUrl && duration > 0 && (
-        <div className="h-20 md:h-24 bg-[#1f1f1f] border-t border-[#333]">
-          <div className="h-5 bg-[#1a1a1a] border-b border-[#333] px-2 flex items-center overflow-x-auto">
-            <div className="flex-1 relative min-w-[300px]">
-              {Array.from({ length: Math.min(Math.ceil(duration) + 1, 30) }).map((_, i) => (
-                <span
-                  key={i}
-                  className="absolute text-[9px] text-gray-500"
-                  style={{ left: `${(i / duration) * 100}%`, transform: 'translateX(-50%)' }}
-                >
-                  {formatTime(i)}
-                </span>
-              ))}
-            </div>
-          </div>
-          <div className="p-2">
-            <div className="relative h-10 md:h-12 bg-[#2a2a2a] rounded cursor-pointer" onClick={handleTimelineClick}>
-              <div
-                className="absolute top-0 bottom-0 bg-blue-500/20 border-x-2 border-blue-500"
-                style={{ left: `${(trimStart / duration) * 100}%`, width: `${((trimEnd - trimStart) / duration) * 100}%` }}
-              />
-              <div
-                className="absolute top-1 bottom-1 bg-gradient-to-r from-blue-600 to-purple-600 rounded opacity-60"
-                style={{ left: `${(trimStart / duration) * 100}%`, width: `${((trimEnd - trimStart) / duration) * 100}%` }}
-              />
-              <div className="absolute top-0 bottom-0 w-0.5 bg-red-500 z-10" style={{ left: `${(currentTime / duration) * 100}%` }}>
-                <div className="absolute -top-1 left-1/2 -translate-x-1/2 w-2 h-2 bg-red-500 rotate-45" />
+      {/* Messages Area */}
+      <div className="flex-1 overflow-y-auto touch-pan-y">
+        <div className="max-w-2xl md:max-w-3xl lg:max-w-4xl mx-auto p-3 sm:p-4 md:p-6 space-y-3 sm:space-y-4">
+          {aiMessages.map((msg, i) => (
+            <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+              <div className={`max-w-[90%] sm:max-w-[85%] md:max-w-[75%]`}>
+                {msg.text && (
+                  <div className={`rounded-2xl px-3 sm:px-4 py-2 text-sm sm:text-base ${
+                    msg.role === 'user'
+                      ? 'bg-blue-600 text-white'
+                      : 'bg-[#2f2f2f] text-gray-200'
+                  }`}>
+                    <pre className="whitespace-pre-wrap font-sans">{msg.text}</pre>
+                  </div>
+                )}
+                {msg.video?.isOutput && (
+                  <div className={`mt-2 rounded-xl overflow-hidden bg-black ${msg.text ? 'mt-2' : ''}`}>
+                    <div className="relative">
+                      <video
+                        src={msg.video.url}
+                        controls
+                        className="w-full max-w-[320px] sm:max-w-md md:max-w-lg lg:max-w-xl"
+                      />
+                    </div>
+                    <div className="flex items-center justify-between px-2 sm:px-3 py-1.5 sm:py-2 bg-[#1a1a1a]">
+                      <div className="flex items-center gap-1.5 sm:gap-2 text-[10px] sm:text-xs text-gray-400">
+                        <Film className="h-3 w-3 sm:h-4 sm:w-4" />
+                        <span>出力動画</span>
+                      </div>
+                      <Button
+                        onClick={() => handleDownload(msg.video!.url)}
+                        size="sm"
+                        className="bg-green-600 hover:bg-green-700 h-6 sm:h-7 md:h-8 text-[10px] sm:text-xs px-2 sm:px-3"
+                      >
+                        <Download className="h-3 w-3 sm:h-4 sm:w-4 mr-1" />
+                        保存
+                      </Button>
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
-          </div>
+          ))}
+
+          {aiLoading && (
+            <div className="flex justify-start">
+              <div className="bg-[#2f2f2f] rounded-2xl px-3 sm:px-4 py-2 text-sm sm:text-base text-gray-400 flex items-center gap-2">
+                <Loader2 className="h-4 w-4 sm:h-5 sm:w-5 animate-spin" />
+                考え中...
+              </div>
+            </div>
+          )}
+
+          {progress && (
+            <div className="flex justify-start">
+              <div className="bg-[#2f2f2f] rounded-2xl px-3 sm:px-4 py-2 sm:py-3 min-w-[180px] sm:min-w-[220px] md:min-w-[280px]">
+                <div className="flex items-center justify-between text-xs sm:text-sm text-gray-300 mb-2">
+                  <span>{progress.message}</span>
+                  <span>{progress.progress}%</span>
+                </div>
+                <div className="w-full bg-gray-700 rounded-full h-1.5 sm:h-2">
+                  <div
+                    className="h-1.5 sm:h-2 rounded-full bg-blue-500 transition-all"
+                    style={{ width: `${progress.progress}%` }}
+                  />
+                </div>
+              </div>
+            </div>
+          )}
+
+          {subtitleProgress && (
+            <div className="flex justify-start">
+              <div className="bg-[#2f2f2f] rounded-2xl px-3 sm:px-4 py-2 sm:py-3">
+                <div className="flex items-center gap-2 text-xs sm:text-sm text-gray-300">
+                  <div className="w-4 h-4 border-2 border-purple-500 border-t-transparent rounded-full animate-spin" />
+                  <span>{subtitleProgress.message}</span>
+                </div>
+              </div>
+            </div>
+          )}
+
+          <div ref={chatEndRef} />
         </div>
-      )}
+      </div>
+
+      {/* Input Area */}
+      <div className="flex-shrink-0 border-t border-[#333] touch-none">
+        <div className="max-w-2xl md:max-w-3xl lg:max-w-4xl mx-auto p-2 sm:p-3 md:p-4">
+          <div className="bg-[#2f2f2f] rounded-2xl px-3 sm:px-4 py-2 sm:py-3">
+            <input
+              ref={inputRef}
+              type="text"
+              value={aiPrompt}
+              onChange={(e) => setAiPrompt(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && handleAiSubmit()}
+              placeholder="メッセージを入力..."
+              disabled={aiLoading || isProcessing}
+              className="w-full bg-transparent text-sm sm:text-base text-white placeholder-gray-500 focus:outline-none disabled:opacity-50 mb-2"
+            />
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="video/*"
+                  multiple
+                  onChange={handleFileChange}
+                  className="hidden"
+                />
+                <button
+                  onClick={handleAddClick}
+                  disabled={isProcessing}
+                  className="text-gray-400 hover:text-white p-1.5 sm:p-2 disabled:opacity-50 hover:bg-[#404040] rounded-full transition-colors"
+                >
+                  <Plus className="h-5 w-5 sm:h-6 sm:w-6" />
+                </button>
+                {project.videos.length > 0 && (
+                  <span className="text-[10px] sm:text-xs text-gray-500">
+                    {project.videos.length}本の動画
+                  </span>
+                )}
+              </div>
+              <Button
+                onClick={handleAiSubmit}
+                size="sm"
+                disabled={aiLoading || isProcessing || !aiPrompt.trim()}
+                className="bg-white hover:bg-gray-200 text-black disabled:opacity-30 rounded-full h-8 w-8 sm:h-9 sm:w-9 p-0"
+              >
+                <Send className="h-4 w-4 sm:h-5 sm:w-5" />
+              </Button>
+            </div>
+          </div>
+          {error && (
+            <p className="text-red-400 text-xs sm:text-sm mt-2 text-center">{error}</p>
+          )}
+        </div>
+      </div>
     </div>
   )
 }
