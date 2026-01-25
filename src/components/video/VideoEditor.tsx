@@ -3,7 +3,6 @@
 import { useState, useCallback, useEffect } from 'react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
-import { Textarea } from '@/components/ui/textarea'
 import { VideoFormat } from '@/schemas/video'
 import { Upload, Wand2, Download, Loader2, CheckCircle, XCircle, AlertTriangle } from 'lucide-react'
 import { processVideo, isFFmpegSupported, type ProcessingProgress } from '@/lib/ffmpeg'
@@ -12,7 +11,6 @@ const MAX_FILE_SIZE_MB = 200
 const MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024
 
 export function VideoEditor() {
-  const [prompt, setPrompt] = useState('')
   const [format, setFormat] = useState<VideoFormat>('tiktok')
   const [file, setFile] = useState<File | null>(null)
   const [fileError, setFileError] = useState<string | null>(null)
@@ -111,7 +109,6 @@ export function VideoEditor() {
     }
     setFile(null)
     setFileError(null)
-    setPrompt('')
     setProgress(null)
     setOutputUrl(null)
     setError(null)
@@ -220,22 +217,6 @@ export function VideoEditor() {
             </div>
           </div>
 
-          {/* Prompt Input (for future AI features) */}
-          <div>
-            <label className="block text-sm font-medium mb-2">編集指示（オプション）</label>
-            <Textarea
-              placeholder="例: 明るくして、テキストを追加して（将来のAI機能用）"
-              value={prompt}
-              onChange={(e) => setPrompt(e.target.value)}
-              rows={3}
-              disabled={isProcessing}
-              className="resize-none"
-            />
-            <p className="text-xs text-gray-500 mt-1">
-              現在はフォーマット変換のみ対応。AI編集機能は近日公開予定。
-            </p>
-          </div>
-
           {/* Progress */}
           {progress && (
             <div className="p-4 rounded-lg bg-gray-50">
@@ -319,28 +300,6 @@ export function VideoEditor() {
           )}
         </CardContent>
       </Card>
-
-      {/* Features */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mt-8">
-        <Card className="p-4">
-          <h3 className="font-semibold mb-2">🎬 ブラウザ内処理</h3>
-          <p className="text-sm text-gray-600">
-            サーバー不要！あなたのブラウザで直接処理
-          </p>
-        </Card>
-        <Card className="p-4">
-          <h3 className="font-semibold mb-2">🔒 プライバシー保護</h3>
-          <p className="text-sm text-gray-600">
-            動画はあなたのデバイスから出ません
-          </p>
-        </Card>
-        <Card className="p-4">
-          <h3 className="font-semibold mb-2">📱 マルチフォーマット</h3>
-          <p className="text-sm text-gray-600">
-            TikTok、YouTube、Instagramなどに対応
-          </p>
-        </Card>
-      </div>
     </div>
   )
 }
