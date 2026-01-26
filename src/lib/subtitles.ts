@@ -100,22 +100,18 @@ async function getTranscriber(
   }
 }
 
-// Extract audio from video and resample to 16kHz mono
-// Uses AudioContext (must be called BEFORE loading Whisper model to avoid OOM on mobile)
-async function extractAudioFromVideo(videoUrl: string, audioContext: AudioContext): Promise<Float32Array> {
-  console.log('Extracting audio from:', videoUrl)
+// Extract audio from video using decodeAudioData (fast, works on desktop)
+async function extractAudioDecode(videoUrl: string, audioContext: AudioContext): Promise<Float32Array> {
+  console.log('Extracting audio via decodeAudioData:', videoUrl)
 
-  // Fetch video data
   const response = await fetch(videoUrl)
   const arrayBuffer = await response.arrayBuffer()
   console.log('Fetched video data, size:', arrayBuffer.byteLength)
 
-  // Ensure AudioContext is running
   if (audioContext.state === 'suspended') {
     await audioContext.resume()
   }
 
-  // Decode audio from video
   const audioBuffer = await audioContext.decodeAudioData(arrayBuffer)
   console.log('Decoded audio:', audioBuffer.duration.toFixed(1), 's,', audioBuffer.sampleRate, 'Hz,', audioBuffer.numberOfChannels, 'ch')
 
@@ -132,24 +128,142 @@ async function extractAudioFromVideo(videoUrl: string, audioContext: AudioContex
     }
   }
 
-  // Resample to 16kHz if needed
-  const targetSampleRate = 16000
-  if (audioBuffer.sampleRate !== targetSampleRate) {
-    const ratio = audioBuffer.sampleRate / targetSampleRate
-    const newLength = Math.round(monoData.length / ratio)
-    const resampled = new Float32Array(newLength)
-    for (let i = 0; i < newLength; i++) {
-      const srcIndex = i * ratio
-      const floor = Math.floor(srcIndex)
-      const ceil = Math.min(floor + 1, monoData.length - 1)
-      const frac = srcIndex - floor
-      resampled[i] = monoData[floor] * (1 - frac) + monoData[ceil] * frac
-    }
-    console.log('Resampled to 16kHz:', resampled.length, 'samples')
-    return resampled
+  return resampleTo16kHz(monoData, audioBuffer.sampleRate)
+}
+
+// Extract audio by playing video and capturing via Web Audio API (works on iOS Safari)
+// iOS Safari's decodeAudioData can't handle MP4/MOV containers, but <video> can play them.
+// We play the video at 2x speed through createMediaElementSource and capture PCM output.
+async function extractAudioPlayback(
+  videoUrl: string,
+  audioContext: AudioContext,
+  onProgress?: (progress: number, message: string) => void
+): Promise<Float32Array> {
+  console.log('Extracting audio via playback capture:', videoUrl)
+
+  if (audioContext.state === 'suspended') {
+    await audioContext.resume()
   }
 
-  return monoData
+  return new Promise<Float32Array>((resolve, reject) => {
+    const video = document.createElement('video')
+    video.playsInline = true
+    video.preload = 'auto'
+    video.src = videoUrl
+
+    let resolved = false
+    const playbackRate = 2
+
+    const cleanup = (source?: AudioNode, processor?: AudioNode, gain?: AudioNode) => {
+      try { source?.disconnect() } catch { /* ignore */ }
+      try { processor?.disconnect() } catch { /* ignore */ }
+      try { gain?.disconnect() } catch { /* ignore */ }
+      video.pause()
+      video.removeAttribute('src')
+      video.load()
+    }
+
+    video.onloadedmetadata = async () => {
+      try {
+        const duration = video.duration
+        console.log('Video duration:', duration, 's, will capture at', playbackRate + 'x')
+
+        const source = audioContext.createMediaElementSource(video)
+        const bufferSize = 4096
+        const processor = audioContext.createScriptProcessor(bufferSize, 1, 1)
+        // Mute output: route through zero-gain node
+        const gainNode = audioContext.createGain()
+        gainNode.gain.value = 0
+
+        source.connect(processor)
+        processor.connect(gainNode)
+        gainNode.connect(audioContext.destination)
+
+        const chunks: Float32Array[] = []
+
+        processor.onaudioprocess = (e) => {
+          const input = e.inputBuffer.getChannelData(0)
+          chunks.push(new Float32Array(input))
+        }
+
+        video.ontimeupdate = () => {
+          if (duration > 0) {
+            const pct = Math.round((video.currentTime / duration) * 100)
+            onProgress?.(5 + pct * 0.15, `音声を抽出中... ${pct}%`)
+          }
+        }
+
+        // Timeout safety: duration/playbackRate + 10s buffer
+        const timeoutMs = ((duration / playbackRate) + 10) * 1000
+        const timeout = setTimeout(() => {
+          if (!resolved) {
+            resolved = true
+            cleanup(source, processor, gainNode)
+            reject(new Error('音声抽出がタイムアウトしました'))
+          }
+        }, timeoutMs)
+
+        video.onended = () => {
+          if (resolved) return
+          resolved = true
+          clearTimeout(timeout)
+
+          const totalLength = chunks.reduce((acc, c) => acc + c.length, 0)
+          console.log('Captured', totalLength, 'samples at', audioContext.sampleRate, 'Hz')
+
+          const fullAudio = new Float32Array(totalLength)
+          let offset = 0
+          for (const chunk of chunks) {
+            fullAudio.set(chunk, offset)
+            offset += chunk.length
+          }
+
+          cleanup(source, processor, gainNode)
+
+          // At 2x playback, each captured sample represents 2x real time
+          // Effective sample rate = audioContext.sampleRate / playbackRate
+          const effectiveRate = audioContext.sampleRate / playbackRate
+          resolve(resampleTo16kHz(fullAudio, effectiveRate))
+        }
+
+        video.playbackRate = playbackRate
+        await video.play()
+      } catch (e) {
+        if (!resolved) {
+          resolved = true
+          cleanup()
+          reject(e)
+        }
+      }
+    }
+
+    video.onerror = () => {
+      if (!resolved) {
+        resolved = true
+        cleanup()
+        reject(new Error('動画の読み込みに失敗しました'))
+      }
+    }
+  })
+}
+
+// Resample audio to 16kHz mono
+function resampleTo16kHz(data: Float32Array, sourceSampleRate: number): Float32Array {
+  const targetRate = 16000
+  if (sourceSampleRate === targetRate) return data
+
+  const ratio = sourceSampleRate / targetRate
+  const newLength = Math.round(data.length / ratio)
+  const resampled = new Float32Array(newLength)
+  for (let i = 0; i < newLength; i++) {
+    const srcIndex = i * ratio
+    const floor = Math.floor(srcIndex)
+    const ceil = Math.min(floor + 1, data.length - 1)
+    const frac = srcIndex - floor
+    resampled[i] = data[floor] * (1 - frac) + data[ceil] * frac
+  }
+  console.log('Resampled to 16kHz:', resampled.length, 'samples from', sourceSampleRate, 'Hz')
+  return resampled
 }
 
 // Generate subtitles from video
@@ -168,10 +282,19 @@ export async function generateSubtitles(
   onProgress?.(5, '音声を抽出中...')
 
   // Step 1: Extract audio (no WASM loaded yet = maximum available memory)
+  const isMobile = typeof navigator !== 'undefined' && /iPhone|iPad|iPod|Android/i.test(navigator.userAgent)
   let audioData: Float32Array
   try {
     const ctx = audioContext || new AudioContext()
-    audioData = await extractAudioFromVideo(videoUrl, ctx)
+    if (isMobile) {
+      // Mobile: iOS Safari's decodeAudioData can't handle MP4/MOV containers
+      // Use video playback capture instead (plays video at 2x and records audio)
+      onProgress?.(5, '音声を抽出中（再生キャプチャ）...')
+      audioData = await extractAudioPlayback(videoUrl, ctx, onProgress)
+    } else {
+      // Desktop: fast decodeAudioData
+      audioData = await extractAudioDecode(videoUrl, ctx)
+    }
     if (!audioContext) await ctx.close()
   } catch (e) {
     throw new Error(`[Step1:音声抽出] ${e instanceof Error ? e.message : String(e)}`)
