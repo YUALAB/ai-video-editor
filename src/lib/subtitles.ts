@@ -181,28 +181,43 @@ export async function generateSubtitles(
 ): Promise<SubtitleSegment[]> {
   onProgress?.(0, '字幕生成を開始...')
 
-  // Get or initialize transcriber
-  const whisper = await getTranscriber(onProgress)
+  // Step 1: Get or initialize transcriber
+  let whisper
+  try {
+    whisper = await getTranscriber(onProgress)
+  } catch (e) {
+    throw new Error(`[Step1:モデル読込] ${e instanceof Error ? e.message : String(e)}`)
+  }
 
   onProgress?.(30, '音声を抽出中...')
 
-  // Extract audio from video (pass pre-created AudioContext for iOS)
-  const audioData = await extractAudioFromVideo(videoUrl, audioContext)
+  // Step 2: Extract audio from video (pass pre-created AudioContext for iOS)
+  let audioData
+  try {
+    audioData = await extractAudioFromVideo(videoUrl, audioContext)
+  } catch (e) {
+    throw new Error(`[Step2:音声抽出] ${e instanceof Error ? e.message : String(e)}`)
+  }
 
   onProgress?.(50, '音声を認識中...')
 
-  // Transcribe with timestamps
+  // Step 3: Transcribe with timestamps
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const result: any = await whisper(audioData, {
-    language,
-    task: 'transcribe',
-    return_timestamps: true,
-    chunk_length_s: 30,
-    stride_length_s: 5,
-    // Prevent hallucinations
-    no_speech_threshold: 0.6,
-    compression_ratio_threshold: 2.4,
-  })
+  let result: any
+  try {
+    result = await whisper(audioData, {
+      language,
+      task: 'transcribe',
+      return_timestamps: true,
+      chunk_length_s: 30,
+      stride_length_s: 5,
+      // Prevent hallucinations
+      no_speech_threshold: 0.6,
+      compression_ratio_threshold: 2.4,
+    })
+  } catch (e) {
+    throw new Error(`[Step3:音声認識] ${e instanceof Error ? e.message : String(e)}`)
+  }
 
   onProgress?.(90, '字幕を生成中...')
 

@@ -1129,9 +1129,11 @@ export function VideoEditor() {
     } catch (err) {
       console.error('Subtitle generation error:', err)
       setSubtitleProgress(null)
+      // Show detailed error for debugging (including stack trace)
+      const errMsg = err instanceof Error ? `${err.message}\n\n[詳細] ${err.stack?.split('\n').slice(0, 3).join('\n') || 'no stack'}` : String(err)
       setAiMessages(prev => [...prev, {
         role: 'ai',
-        text: '字幕の生成に失敗しました: ' + (err instanceof Error ? err.message : '不明なエラー')
+        text: `字幕の生成に失敗しました:\n${errMsg}`
       }])
     } finally {
       setIsGeneratingSubtitles(false)
