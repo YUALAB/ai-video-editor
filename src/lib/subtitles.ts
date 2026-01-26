@@ -1,6 +1,7 @@
 'use client'
 
 import { pipeline, env } from '@huggingface/transformers'
+import { loadFFmpeg } from './ffmpeg'
 
 export interface SubtitleSegment {
   id: string
@@ -100,95 +101,46 @@ async function getTranscriber(
   }
 }
 
-// Extract audio from video and resample to 16kHz mono
-async function extractAudioFromVideo(videoUrl: string, preCreatedAudioContext?: AudioContext): Promise<Float32Array> {
+// Extract audio from video and resample to 16kHz mono using FFmpeg
+// FFmpeg handles any video format reliably on all platforms (including mobile Safari)
+async function extractAudioFromVideo(videoUrl: string): Promise<Float32Array> {
   console.log('Extracting audio from:', videoUrl)
 
-  // Step 2a: Fetch video data
-  let arrayBuffer: ArrayBuffer
-  try {
-    const response = await fetch(videoUrl)
-    arrayBuffer = await response.arrayBuffer()
-    console.log('Fetched audio data, size:', arrayBuffer.byteLength)
-  } catch (error) {
-    throw new Error(`[2a:fetch] ${error instanceof Error ? error.message : String(error)}`)
-  }
+  // Fetch video data
+  const response = await fetch(videoUrl)
+  const arrayBuffer = await response.arrayBuffer()
+  console.log('Fetched video data, size:', arrayBuffer.byteLength)
 
-  // Step 2b: Create/resume AudioContext
-  let audioContext: AudioContext
-  try {
-    audioContext = preCreatedAudioContext || new AudioContext()
-    if (audioContext.state === 'suspended') {
-      await audioContext.resume()
-    }
-    console.log('AudioContext state:', audioContext.state, 'sampleRate:', audioContext.sampleRate)
-  } catch (error) {
-    throw new Error(`[2b:AudioContext] ${error instanceof Error ? error.message : String(error)}`)
-  }
+  // Use FFmpeg to extract audio as raw PCM float32, 16kHz, mono
+  const ff = await loadFFmpeg()
+  await ff.writeFile('subtitle_input.mp4', new Uint8Array(arrayBuffer))
 
-  // Step 2c: Decode audio data
-  let audioBuffer: AudioBuffer
-  try {
-    // Make a copy of arrayBuffer since decodeAudioData detaches it
-    const bufferCopy = arrayBuffer.slice(0)
-    audioBuffer = await audioContext.decodeAudioData(bufferCopy)
-    console.log('Decoded audio:', {
-      duration: audioBuffer.duration,
-      sampleRate: audioBuffer.sampleRate,
-      numberOfChannels: audioBuffer.numberOfChannels,
-      length: audioBuffer.length
-    })
-  } catch (error) {
-    throw new Error(`[2c:decodeAudio] ${error instanceof Error ? error.message : String(error)}`)
-  }
+  await ff.exec([
+    '-i', 'subtitle_input.mp4',
+    '-vn',                    // no video
+    '-f', 'f32le',            // raw float32 little-endian
+    '-acodec', 'pcm_f32le',  // PCM float32
+    '-ar', '16000',           // 16kHz (Whisper requirement)
+    '-ac', '1',               // mono
+    '-y', 'subtitle_audio.raw'
+  ])
 
-  // Step 2d: Mix to mono + resample to 16kHz
-  try {
-    // Get mono audio data
-    let monoData: Float32Array
-    if (audioBuffer.numberOfChannels === 1) {
-      monoData = audioBuffer.getChannelData(0)
-    } else {
-      const left = audioBuffer.getChannelData(0)
-      const right = audioBuffer.getChannelData(1)
-      monoData = new Float32Array(left.length)
-      for (let i = 0; i < left.length; i++) {
-        monoData[i] = (left[i] + right[i]) / 2
-      }
-    }
+  const rawData = await ff.readFile('subtitle_audio.raw')
+  const float32 = new Float32Array(new Uint8Array(rawData as Uint8Array).buffer)
+  console.log('Extracted audio: samples =', float32.length, 'duration =', (float32.length / 16000).toFixed(1), 's')
 
-    // Resample to 16kHz using OfflineAudioContext (more reliable on mobile than manual resampling)
-    const targetSampleRate = 16000
-    if (audioBuffer.sampleRate !== targetSampleRate) {
-      console.log(`Resampling from ${audioBuffer.sampleRate}Hz to ${targetSampleRate}Hz`)
-      const duration = monoData.length / audioBuffer.sampleRate
-      const offlineCtx = new OfflineAudioContext(1, Math.ceil(duration * targetSampleRate), targetSampleRate)
-      const source = offlineCtx.createBufferSource()
-      const offlineBuffer = offlineCtx.createBuffer(1, monoData.length, audioBuffer.sampleRate)
-      offlineBuffer.getChannelData(0).set(monoData)
-      source.buffer = offlineBuffer
-      source.connect(offlineCtx.destination)
-      source.start()
-      const renderedBuffer = await offlineCtx.startRendering()
-      const resampled = renderedBuffer.getChannelData(0)
-      console.log('Resampled audio length:', resampled.length)
-      if (!preCreatedAudioContext) await audioContext.close()
-      return resampled
-    }
+  // Cleanup
+  try { await ff.deleteFile('subtitle_input.mp4') } catch { /* ignore */ }
+  try { await ff.deleteFile('subtitle_audio.raw') } catch { /* ignore */ }
 
-    if (!preCreatedAudioContext) await audioContext.close()
-    return monoData
-  } catch (error) {
-    throw new Error(`[2d:resample] ${error instanceof Error ? error.message : String(error)}`)
-  }
+  return float32
 }
 
 // Generate subtitles from video
 export async function generateSubtitles(
   videoUrl: string,
   language: string = 'ja',
-  onProgress?: (progress: number, message: string) => void,
-  audioContext?: AudioContext
+  onProgress?: (progress: number, message: string) => void
 ): Promise<SubtitleSegment[]> {
   onProgress?.(0, '字幕生成を開始...')
 
@@ -202,10 +154,10 @@ export async function generateSubtitles(
 
   onProgress?.(30, '音声を抽出中...')
 
-  // Step 2: Extract audio from video (pass pre-created AudioContext for iOS)
+  // Step 2: Extract audio from video using FFmpeg
   let audioData
   try {
-    audioData = await extractAudioFromVideo(videoUrl, audioContext)
+    audioData = await extractAudioFromVideo(videoUrl)
   } catch (e) {
     throw new Error(`[Step2:音声抽出] ${e instanceof Error ? e.message : String(e)}`)
   }
