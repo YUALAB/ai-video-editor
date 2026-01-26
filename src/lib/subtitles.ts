@@ -104,34 +104,51 @@ async function getTranscriber(
 async function extractAudioFromVideo(videoUrl: string, preCreatedAudioContext?: AudioContext): Promise<Float32Array> {
   console.log('Extracting audio from:', videoUrl)
 
+  // Step 2a: Fetch video data
+  let arrayBuffer: ArrayBuffer
   try {
-    // Fetch the video/audio data
     const response = await fetch(videoUrl)
-    const arrayBuffer = await response.arrayBuffer()
+    arrayBuffer = await response.arrayBuffer()
     console.log('Fetched audio data, size:', arrayBuffer.byteLength)
+  } catch (error) {
+    throw new Error(`[2a:fetch] ${error instanceof Error ? error.message : String(error)}`)
+  }
 
-    // Use pre-created AudioContext (for iOS Safari user gesture requirement)
-    // or create a new one (desktop)
-    const audioContext = preCreatedAudioContext || new AudioContext()
-    // Ensure the context is running (iOS may have it suspended)
+  // Step 2b: Create/resume AudioContext
+  let audioContext: AudioContext
+  try {
+    audioContext = preCreatedAudioContext || new AudioContext()
     if (audioContext.state === 'suspended') {
       await audioContext.resume()
     }
-    const audioBuffer = await audioContext.decodeAudioData(arrayBuffer)
+    console.log('AudioContext state:', audioContext.state, 'sampleRate:', audioContext.sampleRate)
+  } catch (error) {
+    throw new Error(`[2b:AudioContext] ${error instanceof Error ? error.message : String(error)}`)
+  }
 
+  // Step 2c: Decode audio data
+  let audioBuffer: AudioBuffer
+  try {
+    // Make a copy of arrayBuffer since decodeAudioData detaches it
+    const bufferCopy = arrayBuffer.slice(0)
+    audioBuffer = await audioContext.decodeAudioData(bufferCopy)
     console.log('Decoded audio:', {
       duration: audioBuffer.duration,
       sampleRate: audioBuffer.sampleRate,
       numberOfChannels: audioBuffer.numberOfChannels,
       length: audioBuffer.length
     })
+  } catch (error) {
+    throw new Error(`[2c:decodeAudio] ${error instanceof Error ? error.message : String(error)}`)
+  }
 
-    // Get mono audio data (mix channels if stereo)
+  // Step 2d: Mix to mono + resample to 16kHz
+  try {
+    // Get mono audio data
     let monoData: Float32Array
     if (audioBuffer.numberOfChannels === 1) {
       monoData = audioBuffer.getChannelData(0)
     } else {
-      // Mix stereo to mono
       const left = audioBuffer.getChannelData(0)
       const right = audioBuffer.getChannelData(1)
       monoData = new Float32Array(left.length)
@@ -140,26 +157,21 @@ async function extractAudioFromVideo(videoUrl: string, preCreatedAudioContext?: 
       }
     }
 
-    // Resample to 16kHz if needed (Whisper requires 16kHz)
+    // Resample to 16kHz using OfflineAudioContext (more reliable on mobile than manual resampling)
     const targetSampleRate = 16000
     if (audioBuffer.sampleRate !== targetSampleRate) {
       console.log(`Resampling from ${audioBuffer.sampleRate}Hz to ${targetSampleRate}Hz`)
-      const ratio = audioBuffer.sampleRate / targetSampleRate
-      const newLength = Math.round(monoData.length / ratio)
-      const resampled = new Float32Array(newLength)
-
-      for (let i = 0; i < newLength; i++) {
-        const srcIndex = i * ratio
-        const srcIndexFloor = Math.floor(srcIndex)
-        const srcIndexCeil = Math.min(srcIndexFloor + 1, monoData.length - 1)
-        const fraction = srcIndex - srcIndexFloor
-
-        // Linear interpolation
-        resampled[i] = monoData[srcIndexFloor] * (1 - fraction) + monoData[srcIndexCeil] * fraction
-      }
-
+      const duration = monoData.length / audioBuffer.sampleRate
+      const offlineCtx = new OfflineAudioContext(1, Math.ceil(duration * targetSampleRate), targetSampleRate)
+      const source = offlineCtx.createBufferSource()
+      const offlineBuffer = offlineCtx.createBuffer(1, monoData.length, audioBuffer.sampleRate)
+      offlineBuffer.getChannelData(0).set(monoData)
+      source.buffer = offlineBuffer
+      source.connect(offlineCtx.destination)
+      source.start()
+      const renderedBuffer = await offlineCtx.startRendering()
+      const resampled = renderedBuffer.getChannelData(0)
       console.log('Resampled audio length:', resampled.length)
-      // Only close if we created the context ourselves
       if (!preCreatedAudioContext) await audioContext.close()
       return resampled
     }
@@ -167,8 +179,7 @@ async function extractAudioFromVideo(videoUrl: string, preCreatedAudioContext?: 
     if (!preCreatedAudioContext) await audioContext.close()
     return monoData
   } catch (error) {
-    console.error('Audio extraction failed:', error)
-    throw new Error('音声の抽出に失敗しました')
+    throw new Error(`[2d:resample] ${error instanceof Error ? error.message : String(error)}`)
   }
 }
 
