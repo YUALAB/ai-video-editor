@@ -1094,12 +1094,15 @@ export function VideoEditor() {
 
     try {
       const videoUrl = project.videos[0].url
+      // Create AudioContext during user gesture (required for iOS Safari)
+      const audioCtx = new AudioContext()
       const segments = await generateSubtitles(
         videoUrl,
         'ja',
         (progress, message) => {
           setSubtitleProgress({ progress, message })
-        }
+        },
+        audioCtx
       )
 
       setSubtitles(segments)
