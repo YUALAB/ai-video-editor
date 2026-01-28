@@ -23,7 +23,7 @@ export const DEFAULT_SUBTITLE_STYLE: SubtitleStyle = {
   backgroundColor: 'rgba(0, 0, 0, 0.7)'
 }
 
-// Transcription pipeline singleton
+// Whisper transcription pipeline singleton
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let transcriber: any = null
 let isLoading = false
